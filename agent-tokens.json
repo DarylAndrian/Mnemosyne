@@ -1,0 +1,12 @@
+{
+  "daryl_mem_bjfX9_uJt6YzWVBW51CBUGgiFUO2z8pwGU7zGzNodBg": {
+    "agent_id": "hermes-vps",
+    "display_name": "Hermes VPS",
+    "created_at": "2026-08-21T11:29:47.153730+00:00"
+  },
+  "daryl_mem_mGkCl3oR_LrVM7GqNST4A2nfju8jT0V7TIVGjYuCVZI": {
+    "agent_id": "hermes-laptop",
+    "display_name": "Hermes Laptop",
+    "created_at": "2026-08-21T11:29:47.160105+00:00"
+  }
+}

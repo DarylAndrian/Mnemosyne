@@ -38,21 +38,47 @@ mcp = FastMCP(
 
 
 # ---------------------------------------------------------------------------
-# Auth middleware: shared API key via Authorization: Bearer <key>
+# Auth middleware: shared API key OR per-agent token via Authorization: Bearer
 # ---------------------------------------------------------------------------
 
 class ApiKeyMiddleware(BaseHTTPMiddleware):
+    """Auth middleware that supports:
+    1. The original shared MCP_API_KEY (legacy, any agent_id)
+    2. Per-agent tokens from agent-tokens.json (auto-sets agent_id)
+    """
+
+    def __init__(self, app):
+        super().__init__(app)
+        self._agent_tokens: dict = {}
+
+    def _reload_tokens(self) -> None:
+        from .agent_tokens import load_tokens
+        self._agent_tokens = load_tokens()
+
     async def dispatch(self, request, call_next):
         # Health endpoint stays open for monitoring
         if request.url.path in ("/health", "/"):
             return await call_next(request)
+
         auth = request.headers.get("authorization", "")
-        if not settings.mcp_api_key:
-            log.error("MCP_API_KEY not configured -- rejecting all MCP requests")
-            return JSONResponse({"error": "server misconfigured"}, status_code=500)
-        if not auth.startswith("Bearer ") or auth[7:].strip() != settings.mcp_api_key:
+        token = auth[7:].strip() if auth.startswith("Bearer ") else ""
+
+        if not token:
             return JSONResponse({"error": "unauthorized"}, status_code=401)
-        return await call_next(request)
+
+        # 1. Check shared API key (legacy -- any agent_id)
+        if settings.mcp_api_key and token == settings.mcp_api_key:
+            return await call_next(request)
+
+        # 2. Check per-agent token (auto-sets agent_id via request state)
+        self._reload_tokens()
+        agent_id = self._agent_tokens.get(token, {}).get("agent_id")
+        if agent_id:
+            # Store agent_id in request state so tools can read it
+            request.state.agent_id = agent_id
+            return await call_next(request)
+
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
 
 
 # ---------------------------------------------------------------------------
@@ -60,14 +86,14 @@ class ApiKeyMiddleware(BaseHTTPMiddleware):
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-async def remember(content: str, agent_id: str, session_id: str = "", tags: list[str] | None = None) -> dict:
+async def remember(content: str, agent_id: str = "", session_id: str = "", tags: list[str] | None = None) -> dict:
     """Store a memory. The server extracts entities/relationships/facts into
     the knowledge graph, detects conflicts with existing facts, and embeds
     the episode for semantic search.
 
     Args:
         content: The raw memory content (conversation excerpt, note, event).
-        agent_id: Identifier of the agent storing this memory.
+        agent_id: Identifier of the agent storing this memory. Auto-set from token if not provided.
         session_id: Optional session identifier for provenance.
         tags: Optional list of tags.
 
@@ -75,6 +101,13 @@ async def remember(content: str, agent_id: str, session_id: str = "", tags: list
         Episode id, created/merged entities, relationship count, and any
         conflicts detected. Report conflicts to the user.
     """
+    # Auto-set agent_id from per-agent token if not explicitly provided
+    from starlette.requests import request as _req
+    try:
+        if not agent_id:
+            agent_id = getattr(_req.state, "agent_id", "unknown")
+    except Exception:
+        pass
     return (await engine.remember(content, agent_id, session_id, tags)).model_dump()
 
 
