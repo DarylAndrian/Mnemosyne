@@ -8,6 +8,7 @@ Run:  python -m server.main
 
 from __future__ import annotations
 
+import contextvars
 import logging
 import sys
 
@@ -18,6 +19,12 @@ from starlette.responses import JSONResponse
 from .config import get_settings
 from .engine import MemoryEngine
 from .graph.schema import ensure_schema
+
+# Context variable for per-agent token attribution
+# Set by auth middleware, read by tool handlers
+current_agent_id: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "current_agent_id", default=""
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -70,12 +77,11 @@ class ApiKeyMiddleware(BaseHTTPMiddleware):
         if settings.mcp_api_key and token == settings.mcp_api_key:
             return await call_next(request)
 
-        # 2. Check per-agent token (auto-sets agent_id via request state)
+        # 2. Check per-agent token (auto-sets agent_id via context var)
         self._reload_tokens()
         agent_id = self._agent_tokens.get(token, {}).get("agent_id")
         if agent_id:
-            # Store agent_id in request state so tools can read it
-            request.state.agent_id = agent_id
+            current_agent_id.set(agent_id)
             return await call_next(request)
 
         return JSONResponse({"error": "unauthorized"}, status_code=401)
@@ -102,12 +108,8 @@ async def remember(content: str, agent_id: str = "", session_id: str = "", tags:
         conflicts detected. Report conflicts to the user.
     """
     # Auto-set agent_id from per-agent token if not explicitly provided
-    from starlette.requests import request as _req
-    try:
-        if not agent_id:
-            agent_id = getattr(_req.state, "agent_id", "unknown")
-    except Exception:
-        pass
+    if not agent_id:
+        agent_id = current_agent_id.get() or "unknown"
     return (await engine.remember(content, agent_id, session_id, tags)).model_dump()
 
 
