@@ -140,6 +140,10 @@ class MemoryEngine:
 
         # 3. Dedup + upsert entities
         for ent in extraction.entities:
+            # Type safety: ensure aliases is a list of strings
+            if not isinstance(ent.aliases, list):
+                ent.aliases = []
+            ent.aliases = [str(a) for a in ent.aliases if isinstance(a, str)][:10]
             ent_id, merged_into = await self._upsert_entity(ent)
             name_to_entity_id[_norm_name(ent.name)] = ent_id
             for alias in ent.aliases:
@@ -231,9 +235,11 @@ class MemoryEngine:
         candidates = await self.graph.run(Q.FIND_ENTITY_FUZZY, needle=ent.name)
         best, best_sim = None, 0.0
         for cand in candidates:
-            sim = max(_name_similarity(ent.name, cand["name"]),
-                      *(_name_similarity(ent.name, a) for a in (cand.get("aliases") or [])),
-                      default=0.0)
+            sims = [_name_similarity(ent.name, cand["name"])]
+            for a in (cand.get("aliases") or []):
+                if isinstance(a, str):
+                    sims.append(_name_similarity(ent.name, a))
+            sim = max(sims) if sims else 0.0
             if sim > best_sim:
                 best, best_sim = cand, sim
         if best and best_sim >= 0.85:
