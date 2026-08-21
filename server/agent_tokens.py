@@ -1,4 +1,4 @@
-"""Agent token management for Daryl-Memories.
+"""Agent token management for Mnemosyne.
 
 Each agent gets a unique token mapped to an agent_id.
 The auth middleware looks up the token and auto-sets agent_id on tool calls.
@@ -32,7 +32,7 @@ def save_tokens(tokens: dict) -> None:
 def create_agent(name: str, display_name: str = "") -> dict:
     """Create a new agent with a unique token. Returns the agent info."""
     tokens = load_tokens()
-    token = f"daryl_mem_{secrets.token_urlsafe(32)}"
+    token = f"mnem_{secrets.token_urlsafe(32)}"
     agent_id = f"hermes-{name}"
     tokens[token] = {
         "agent_id": agent_id,
@@ -95,7 +95,7 @@ if __name__ == "__main__":
         print(f"  token:         {info['token']}")
         print(f"\nAdd to their Hermes config:")
         print(f'  "mcpServers": {{')
-        print(f'    "daryl-memories": {{')
+        print(f'    "mnemosyne": {{')
         print(f'      "url": "http://<THIS_HOST_IP>:8080/mcp",')
         print(f'      "headers": {{"Authorization": "Bearer {info["token"]}"}}')
         print(f'    }}')

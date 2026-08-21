@@ -1,4 +1,4 @@
-"""Pour all Hermes memories into Daryl-Memories shared memory system.
+"""Pour all Hermes memories into Mnemosyne shared memory system.
 
 Calls the engine directly (bypasses MCP session management).
 """
@@ -121,13 +121,13 @@ MEMORIES = [
         ["machine", "specs", "host", "infrastructure"]
     ),
     (
-        "Daryl-Memories MCP server: Python + FastMCP + Streamable HTTP. "
+        "Mnemosyne MCP server: Python + FastMCP + Streamable HTTP. "
         "Runs on port 8080. Neo4j on localhost:7687 (bolt). "
         "Ollama on localhost:11434 (native, not Docker). "
         "API key auth via Bearer token. "
         "Models: qwen2.5:3b (extraction) + nomic-embed-text (768-dim embeddings). "
-        "GitHub repo: https://github.com/DarylAndrian/Daryl-Memories",
-        ["daryl-memories", "mcp", "server", "infrastructure"]
+        "GitHub repo: https://github.com/DarylAndrian/Mnemosyne",
+        ["mnemosyne", "mcp", "server", "infrastructure"]
     ),
     (
         "CloudDrive server: Fastify on port 3000, managed by pm2 (clouddrive). "

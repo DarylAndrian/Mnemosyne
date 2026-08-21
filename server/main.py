@@ -1,4 +1,4 @@
-"""Daryl-Memories MCP server entry point.
+"""Mnemosyne MCP server entry point.
 
 FastMCP (official mcp package) with Streamable HTTP transport and a
 shared-API-key auth middleware.
@@ -24,13 +24,13 @@ logging.basicConfig(
     format="%(asctime)s %(name)s %(levelname)s %(message)s",
     stream=sys.stdout,
 )
-log = logging.getLogger("daryl-memories")
+log = logging.getLogger("mnemosyne")
 
 settings = get_settings()
 engine = MemoryEngine(settings)
 
 mcp = FastMCP(
-    "daryl-memories",
+    "mnemosyne",
     host=settings.mcp_host,
     port=settings.mcp_port,
     streamable_http_path="/mcp",
@@ -230,7 +230,7 @@ def main() -> None:
         await _mount_health(app)
 
         log.info(
-            "Daryl-Memories MCP serving on http://%s:%s/mcp (health: /health)",
+            "Mnemosyne MCP serving on http://%s:%s/mcp (health: /health)",
             settings.mcp_host, settings.mcp_port,
         )
         config = uvicorn.Config(app, host=settings.mcp_host, port=settings.mcp_port, log_level="info")

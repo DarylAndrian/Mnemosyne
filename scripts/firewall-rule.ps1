@@ -1,4 +1,4 @@
-# Windows Firewall rule for Daryl-Memories MCP server
+# Windows Firewall rule for Mnemosyne MCP server
 # Run as Administrator to allow connections from other machines on port 8080
 
 param(
@@ -6,7 +6,7 @@ param(
     [switch]$Remove
 )
 
-$RuleName = "Daryl-Memories MCP (TCP 8080)"
+$RuleName = "Mnemosyne MCP (TCP 8080)"
 
 if ($Remove) {
     Remove-NetFirewallRule -DisplayName $RuleName -ErrorAction SilentlyContinue
@@ -32,7 +32,7 @@ New-NetFirewallRule `
     -LocalPort 8080 `
     -Action Allow `
     -RemoteAddress $ClientIPs `
-    -Description "Allow Daryl-Memories MCP connections from agent machines" `
+    -Description "Allow Mnemosyne MCP connections from agent machines" `
     -Profile Private
 
 Write-Host "Firewall rule created: $RuleName"

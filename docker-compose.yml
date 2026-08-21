@@ -1,7 +1,7 @@
 services:
   neo4j:
     image: neo4j:5.26.3-community
-    container_name: daryl-memories-neo4j
+    container_name: mnemosyne-neo4j
     ports:
       # Bind to localhost ONLY -- Neo4j must never be exposed to the network.
       # The MCP server (port 8080) is the sole externally reachable surface.

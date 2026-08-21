@@ -24,7 +24,7 @@ from .models import (
     RememberResponse,
 )
 
-log = logging.getLogger("daryl-memories.engine")
+log = logging.getLogger("mnemosyne.engine")
 
 # --- scoring constants (from PRD v2) ---
 W_VECTOR, W_KEYWORD, W_GRAPH = 0.4, 0.3, 0.3

@@ -1,4 +1,4 @@
-# Daryl-Memories
+# Mnemosyne
 
 Shared GraphRAG memory MCP server for 3 Hermes agents. Fully local -- no data leaves the network.
 
@@ -23,8 +23,8 @@ Machine 1 (HOST: this PC)         Machine 2         Machine 3
 
 ```bash
 # 1. Clone and configure
-git clone https://github.com/DarylAndrian/Daryl-Memories.git
-cd Daryl-Memories
+git clone https://github.com/DarylAndrian/Mnemosyne.git
+cd Mnemosyne
 cp .env.example .env
 # Edit .env with your passwords
 
@@ -87,7 +87,7 @@ Add to your Hermes config:
 ```json
 {
   "mcpServers": {
-    "daryl-memories": {
+    "mnemosyne": {
       "url": "http://<HOST_IP>:8080/mcp",
       "headers": {
         "Authorization": "Bearer <MCP_API_KEY>"

@@ -15,7 +15,7 @@ import httpx
 from ..config import Settings
 from ..models import ExtractionResult
 
-log = logging.getLogger("daryl-memories.extract")
+log = logging.getLogger("mnemosyne.extract")
 
 EXTRACTION_PROMPT = """You are a precise information extraction system. Analyze the conversation and extract structured information.
 
