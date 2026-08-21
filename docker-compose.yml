@@ -1,0 +1,30 @@
+services:
+  neo4j:
+    image: neo4j:5.26.3-community
+    container_name: daryl-memories-neo4j
+    ports:
+      # Bind to localhost ONLY -- Neo4j must never be exposed to the network.
+      # The MCP server (port 8080) is the sole externally reachable surface.
+      - "127.0.0.1:7474:7474"
+      - "127.0.0.1:7687:7687"
+    environment:
+      NEO4J_AUTH: ${NEO4J_AUTH}
+      # Memory caps so Neo4j stays a good citizen on the 32GB host
+      NEO4J_server_memory_heap_max__size: 2G
+      NEO4J_server_memory_pagecache_size: 1G
+      NEO4J_db_tx__log_rotation_retention__policy: 2 files
+    volumes:
+      # Named volumes: immune to the space in C:\Users\hokishop jayajaya
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:7474 >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+volumes:
+  neo4j_data:
+  neo4j_logs:
