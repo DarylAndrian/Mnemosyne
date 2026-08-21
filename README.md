@@ -41,6 +41,21 @@ python -m server.main
 
 The server starts on `http://0.0.0.0:8080/mcp`. Health check at `/health`.
 
+## Memory Graph Frontend
+
+An Obsidian-style graph viewer is served at `http://<HOST_IP>:8080/` (same port as MCP).
+
+- Force-directed graph of entities, colored by type
+- Click a node: aliases, facts, episodes, 1-3 hop neighborhood
+- Double-click: expand neighborhood
+- Recall box: hybrid RAG search (same pipeline as the `recall` tool)
+- Filters by entity type, node limit, include episodes
+- Paste `MCP_API_KEY` or an agent token in the top-right to unlock API calls
+
+No build step and no internet needed -- plain HTML/JS with vis-network vendored in
+`frontend/vendor/`. The API endpoints (`/api/graph`, `/api/entity`, `/api/recall`,
+`/api/episodes`, `/api/stats`) require the same Bearer token as MCP; static files are public.
+
 ## Environment Variables
 
 | Variable | Default | Description |
