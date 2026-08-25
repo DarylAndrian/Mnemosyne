@@ -15,6 +15,12 @@ module.exports = {
     instances: 1,
     autorestart: true,
     watch: false,
+    // Do NOT tree-kill on restart. The deploy webhook spawns a detached
+    // finisher script that must SURVIVE the `pm2 restart` the deploy
+    // performs. With treekill enabled (default), Windows kills the whole
+    // process tree and the finisher dies mid-poll. Same pattern as
+    // CloudDrive's ecosystem.config.cjs.
+    treekill: false,
     max_memory_restart: '2G',
     env: {
       PYTHONPATH: '',

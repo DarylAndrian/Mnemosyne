@@ -9,6 +9,7 @@ STATUS="$REPO/deploy-status.json"
 HEALTH="http://localhost:8080/health"
 LOG="$REPO/logs/deploy.log"
 mkdir -p "$REPO/logs"
+echo "[$(date '+%F %T')] finisher LAUNCHED (pid $$)" >> "$LOG"
 
 write_status() {
   # $1=status $2=commit $3=extra message
