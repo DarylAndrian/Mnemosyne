@@ -151,3 +151,11 @@ Add to your Hermes config:
 ## License
 
 MIT
+
+## Auto-deploy
+
+Pushes to `main` deploy automatically via GitHub webhook
+(`POST /api/deploy/webhook`, HMAC-SHA256 verified). A detached finisher
+pulls, restarts the pm2 process, polls `/health`, and auto-rolls back to
+the previous commit if the new code fails its health check within 120s.
+Check `GET /api/deploy/status` for the last deploy state.
