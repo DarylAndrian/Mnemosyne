@@ -19,6 +19,7 @@ import hmac
 import hashlib
 import json
 import logging
+import os
 import subprocess
 from pathlib import Path
 
@@ -31,6 +32,23 @@ log = logging.getLogger("mnemosyne.deploy")
 REPO_DIR = Path(__file__).resolve().parent.parent
 STATUS_FILE = REPO_DIR / "deploy-status.json"
 FINISHER = REPO_DIR / "scripts" / "deploy-finisher.sh"
+
+# IMPORTANT: bare "bash" resolves to Windows' WSL shim (System32\bash.exe)
+# in subprocess contexts and fails with "execvpe(/bin/bash) failed".
+# Use git-bash explicitly, with a PATH fallback.
+_BASH_CANDIDATES = [
+    os.environ.get("GIT_BASH"),
+    str(Path.home() / "AppData" / "Local" / "hermes" / "git" / "usr" / "bin" / "bash.exe"),
+    r"C:\Program Files\Git\usr\bin\bash.exe",
+    r"C:\Program Files (x86)\Git\usr\bin\bash.exe",
+]
+
+
+def _find_bash() -> str:
+    for c in _BASH_CANDIDATES:
+        if c and Path(c).exists():
+            return c
+    return "bash"  # last resort
 
 
 def _read_status() -> dict:
@@ -94,9 +112,12 @@ async def deploy_webhook(request: Request) -> JSONResponse:
         pass
 
     # Detached finisher survives our own pm2 restart.
+    # NOTE: forward slashes -- git-bash's cd chokes on backslash paths,
+    # which would leave REPO empty and silently kill the deploy.
+    # NOTE: explicit git-bash -- bare "bash" is the WSL shim and fails.
     try:
         subprocess.Popen(
-            ["bash", str(FINISHER)],
+            [_find_bash(), str(FINISHER).replace("\\", "/")],
             cwd=str(REPO_DIR),
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,

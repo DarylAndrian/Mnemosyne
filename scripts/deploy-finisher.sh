@@ -4,7 +4,11 @@
 # Writes deploy-status.json at every stage (read by GET /api/deploy/status).
 
 set -u
-REPO="$(cd "$(dirname "$0")/.." && pwd)"
+REPO="$(cd "$(dirname "$0")/.." 2>/dev/null && pwd)"
+if [ -z "$REPO" ]; then
+  echo "FATAL: cannot resolve repo dir from \$0=$0" >&2
+  exit 1
+fi
 STATUS="$REPO/deploy-status.json"
 HEALTH="http://localhost:8080/health"
 LOG="$REPO/logs/deploy.log"
