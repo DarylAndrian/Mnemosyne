@@ -43,6 +43,8 @@ class Settings:
         a.strip() for a in os.environ.get("ALLOWED_AGENTS", "").split(",") if a.strip()
     ])
 
+    deploy_webhook_secret: str = field(default_factory=lambda: os.environ.get("DEPLOY_WEBHOOK_SECRET", ""))
+
     embed_dim: int = 768  # nomic-embed-text output dimension
 
     def validate(self) -> list[str]:

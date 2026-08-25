@@ -71,6 +71,13 @@ class ApiKeyMiddleware(BaseHTTPMiddleware):
         # This lets the Obsidian-style frontend load without a token, but API calls still require it.
         if path in ("/health", "/", "/index.html"):
             return await call_next(request)
+        # Deploy webhook authenticates via HMAC signature (X-Hub-Signature-256),
+        # not a Bearer token -- verified inside the handler.
+        if path == "/api/deploy/webhook":
+            return await call_next(request)
+        # Deploy status is read-only monitoring info -- public like /health.
+        if path == "/api/deploy/status":
+            return await call_next(request)
         if path.startswith("/assets/") or path.startswith("/static/"):
             return await call_next(request)
         # Frontend bundle files (no auth needed to load the SPA shell)
@@ -546,6 +553,9 @@ def main() -> None:
         app.add_middleware(ApiKeyMiddleware)
         await _mount_health(app)
         await _mount_api(app)
+        from .deploy import mount_deploy
+
+        await mount_deploy(app)
         await _mount_frontend(app)
 
         log.info(
