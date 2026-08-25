@@ -14,12 +14,55 @@ CREATE (ep:Episode {
   tags: $tags,
   source_agent_id: $source_agent_id,
   source_session_id: $source_session_id,
+  request_id: $request_id,
+  content_hash: $content_hash,
+  status: 'pending',
   created_at: datetime(),
   updated_at: datetime(),
   active: true,
   access_count: 0
 })
 RETURN ep.id AS id
+"""
+
+# Idempotency: find the episode created for a given client request_id
+FIND_EPISODE_BY_REQUEST_ID = """
+MATCH (ep:Episode)
+WHERE ep.request_id = $rid AND ep.request_id <> ''
+RETURN ep.id AS id, ep.status AS status
+LIMIT 1
+"""
+
+# Exact content dedup: same hash within the dedup window
+FIND_EPISODE_BY_HASH_RECENT = """
+MATCH (ep:Episode)
+WHERE ep.content_hash = $content_hash AND ep.content_hash <> ''
+  AND ep.active = true
+  AND ep.created_at > datetime() - duration('PT5M')
+RETURN ep.id AS id, ep.status AS status
+ORDER BY ep.created_at DESC
+LIMIT 1
+"""
+
+# Near-duplicate check: recent episodes for token-overlap comparison
+RECENT_EPISODES_IN_WINDOW = """
+MATCH (ep:Episode)
+WHERE ep.active = true
+  AND ep.created_at > datetime() - duration('PT5M')
+RETURN ep.id AS id, ep.content AS content, ep.status AS status
+ORDER BY ep.created_at DESC
+LIMIT 20
+"""
+
+SET_EPISODE_STATUS = """
+MATCH (ep:Episode {id: $episode_id})
+SET ep.status = $status, ep.updated_at = datetime()
+RETURN ep.id AS id
+"""
+
+GET_EPISODE_STATUS = """
+MATCH (ep:Episode {id: $episode_id})
+RETURN ep.id AS id, ep.status AS status, ep.request_id AS request_id
 """
 
 SET_EPISODE_EMBEDDING = """

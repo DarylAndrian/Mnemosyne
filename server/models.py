@@ -70,3 +70,9 @@ class RememberResponse(BaseModel):
     facts_stored: int = 0
     conflicts_detected: list[ConflictInfo] = Field(default_factory=list)
     embedding_status: str = "ok"
+    # True while LLM extraction + embedding run in the background
+    processing: bool = False
+    # True when an existing episode was returned instead of creating a new one
+    deduplicated: bool = False
+    # Episode processing status: pending | processed | failed
+    status: str = "processed"

@@ -72,10 +72,32 @@ No build step and no internet needed -- plain HTML/JS with vis-network vendored 
 
 ## MCP Tools
 
-### `remember(content, agent_id, session_id?, tags?)`
+### `remember(content, agent_id, session_id?, tags?, request_id?)`
 
-Store a memory. Server extracts entities, relationships, and facts into the
-knowledge graph. Detects conflicts with existing facts.
+Store a memory. Returns immediately with `episode_id` and `processing: true`;
+entity/relationship/fact extraction and embedding run in the background.
+Detects conflicts with existing facts.
+
+### `episode_status(episode_id)`
+
+Check the background processing status of a stored episode:
+`pending`, `processed`, `failed`, or `not_found`.
+
+## Latency & Retries (read this before integrating)
+
+- **`remember` returns in milliseconds.** The DB write happens first; the slow
+  part (LLM extraction + embeddings, 10-20s on CPU-only hosts) runs in the
+  background. No client timeout issues.
+- **Always send a `request_id`** (a UUID per logical store intent). If your
+  client times out and retries with the same `request_id`, the server returns
+  the original episode (`deduplicated: true`) instead of creating a duplicate.
+  Idempotency keys never expire.
+- **Automatic dedup**: identical content (SHA-256 of normalized text) or
+  near-identical content (>= 97% token overlap) stored within a 5-minute
+  window returns the existing episode with `deduplicated: true`.
+- Use `episode_status` to poll background completion if your agent needs
+  extracted entities/facts to be ready; full-text recall works immediately,
+  vector recall once embedding completes.
 
 ### `recall(query, top_k?, agent_id?)`
 

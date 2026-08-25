@@ -17,6 +17,8 @@ INDEXES = [
     "CREATE INDEX IF NOT EXISTS FOR (n:Entity) ON (n.name)",
     "CREATE INDEX IF NOT EXISTS FOR (n:Entity) ON (n.type)",
     "CREATE INDEX IF NOT EXISTS FOR (n:Episode) ON (n.created_at)",
+    "CREATE INDEX IF NOT EXISTS FOR (n:Episode) ON (n.request_id)",
+    "CREATE INDEX IF NOT EXISTS FOR (n:Episode) ON (n.content_hash)",
     "CREATE INDEX IF NOT EXISTS FOR (n:Fact) ON (n.subject)",
 ]
 

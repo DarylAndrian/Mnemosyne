@@ -110,25 +110,54 @@ class ApiKeyMiddleware(BaseHTTPMiddleware):
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-async def remember(content: str, agent_id: str = "", session_id: str = "", tags: list[str] | None = None) -> dict:
-    """Store a memory. The server extracts entities/relationships/facts into
-    the knowledge graph, detects conflicts with existing facts, and embeds
-    the episode for semantic search.
+async def remember(
+    content: str,
+    agent_id: str = "",
+    session_id: str = "",
+    tags: list[str] | None = None,
+    request_id: str = "",
+) -> dict:
+    """Store a memory. Returns immediately with episode_id and
+    processing=true; entity/relationship/fact extraction and embedding
+    run in the background (10-20s on CPU-only hosts). Check completion
+    with episode_status if needed.
+
+    Idempotent: pass a unique request_id per logical store intent (e.g.
+    a UUID) and retries after a client timeout return the original
+    episode instead of creating duplicates. Identical or near-identical
+    content within 5 minutes is also deduplicated automatically.
 
     Args:
         content: The raw memory content (conversation excerpt, note, event).
         agent_id: Identifier of the agent storing this memory. Auto-set from token if not provided.
         session_id: Optional session identifier for provenance.
         tags: Optional list of tags.
+        request_id: Optional client-generated idempotency key (UUID recommended).
 
     Returns:
-        Episode id, created/merged entities, relationship count, and any
-        conflicts detected. Report conflicts to the user.
+        episode_id, processing flag, and status. If deduplicated=true,
+        the episode already existed and nothing new was stored.
     """
     # Auto-set agent_id from per-agent token if not explicitly provided
     if not agent_id:
         agent_id = current_agent_id.get() or "unknown"
-    return (await engine.remember(content, agent_id, session_id, tags)).model_dump()
+    return (await engine.remember(content, agent_id, session_id, tags, request_id)).model_dump()
+
+
+@mcp.tool()
+async def episode_status(episode_id: str) -> dict:
+    """Check the background processing status of an episode stored via
+    remember. Use after remember returns processing=true if you need to
+    know when extraction/embedding finished.
+
+    Args:
+        episode_id: Episode id returned by remember (starts with 'ep_').
+
+    Returns:
+        Status: pending (still processing), processed (complete),
+        failed (extraction error), or not_found.
+    """
+    return await engine.episode_status(episode_id)
 
 
 @mcp.tool()

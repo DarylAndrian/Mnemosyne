@@ -5,6 +5,7 @@ Pipeline owner for remember / recall / context / resolve / forget.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import re
@@ -34,6 +35,10 @@ RECENCY_FLOOR = 0.5
 ACCESS_BOOST_STEP = 0.1
 ACCESS_BOOST_CAP = 2.0
 
+# Near-duplicate detection: token overlap at/above this within the 5-min
+# window (see RECENT_EPISODES_IN_WINDOW / FIND_EPISODE_BY_HASH_RECENT)
+NEAR_DUP_TOKEN_OVERLAP = 0.97
+
 
 def new_id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex[:16]}"
@@ -41,6 +46,12 @@ def new_id(prefix: str) -> str:
 
 def _norm_name(name: str) -> str:
     return re.sub(r"\s+", " ", name.strip().lower())
+
+
+def _content_hash(content: str) -> str:
+    """Stable hash of whitespace-normalized, lowercased content."""
+    normalized = re.sub(r"\s+", " ", content.strip().lower())
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
 def _name_similarity(a: str, b: str) -> float:
@@ -93,6 +104,7 @@ class MemoryEngine:
         self.graph = GraphDriver(settings)
         self.embedder = OllamaEmbedder(settings)
         self.llm = ExtractionLLM(settings)
+        self._bg_tasks: set[asyncio.Task] = set()
 
     async def close(self) -> None:
         await self.llm.close()
@@ -109,12 +121,54 @@ class MemoryEngine:
         agent_id: str,
         session_id: str = "",
         tags: list[str] | None = None,
+        request_id: str = "",
     ) -> RememberResponse:
         tags = tags or []
+
+        # --- Dedup gate (before any write) ---------------------------------
+
+        # 1. Idempotency key: same request_id always returns the original
+        if request_id:
+            existing = await self.graph.run_one(Q.FIND_EPISODE_BY_REQUEST_ID, rid=request_id)
+            if existing:
+                status = existing.get("status") or "processed"
+                return RememberResponse(
+                    episode_id=existing["id"],
+                    deduplicated=True,
+                    processing=(status == "pending"),
+                    status=status,
+                )
+
+        # 2. Exact content hash within the 5-min window
+        content_hash = _content_hash(content)
+        existing = await self.graph.run_one(Q.FIND_EPISODE_BY_HASH_RECENT, content_hash=content_hash)
+        if existing:
+            status = existing.get("status") or "processed"
+            return RememberResponse(
+                episode_id=existing["id"],
+                deduplicated=True,
+                processing=(status == "pending"),
+                status=status,
+            )
+
+        # 3. Near-duplicate: high token overlap with a very recent episode
+        recent = await self.graph.run(Q.RECENT_EPISODES_IN_WINDOW)
+        for old in recent:
+            if _token_overlap(content, old.get("content") or "") >= NEAR_DUP_TOKEN_OVERLAP:
+                status = old.get("status") or "processed"
+                return RememberResponse(
+                    episode_id=old["id"],
+                    deduplicated=True,
+                    processing=(status == "pending"),
+                    status=status,
+                )
+
+        # --- Store fast, process in background ------------------------------
+
         episode_id = new_id("ep")
         summary = content[:300].replace("\n", " ")
 
-        # 1. Store raw episode first (survives extraction failure)
+        # Store raw episode first (survives extraction failure)
         await self.graph.run(
             Q.CREATE_EPISODE,
             id=episode_id,
@@ -123,105 +177,122 @@ class MemoryEngine:
             tags=tags,
             source_agent_id=agent_id,
             source_session_id=session_id,
+            request_id=request_id,
+            content_hash=content_hash,
         )
 
-        # 2. Extract entities / relationships / facts
-        extraction = await self.llm.extract(
-            content, agent_id=agent_id, session_id=session_id, tags=tags
+        # LLM extraction + embedding run async so the MCP call returns fast
+        task = asyncio.create_task(
+            self._process_episode(episode_id, content, agent_id, session_id, tags)
         )
-
-        entities_created: list[str] = []
-        entities_merged: list[str] = []
-        rel_count = 0
-        fact_count = 0
-        conflicts: list[ConflictInfo] = []
-
-        name_to_entity_id: dict[str, str] = {}
-
-        # 3. Dedup + upsert entities
-        for ent in extraction.entities:
-            # Type safety: ensure aliases is a list of strings
-            if not isinstance(ent.aliases, list):
-                ent.aliases = []
-            ent.aliases = [str(a) for a in ent.aliases if isinstance(a, str)][:10]
-            ent_id, merged_into = await self._upsert_entity(ent)
-            name_to_entity_id[_norm_name(ent.name)] = ent_id
-            for alias in ent.aliases:
-                name_to_entity_id.setdefault(_norm_name(alias), ent_id)
-            if merged_into:
-                entities_merged.append(f"{ent.name} -> {merged_into}")
-            else:
-                entities_created.append(ent.name)
-
-        # 4. Relationships (resolve endpoint names, creating missing entities)
-        for rel in extraction.relationships:
-            from_id = await self._resolve_entity_id(rel.from_name, name_to_entity_id)
-            to_id = await self._resolve_entity_id(rel.to_name, name_to_entity_id)
-            if not from_id or not to_id:
-                continue
-            await self.graph.run(
-                Q.CREATE_RELATIONSHIP_STATIC,
-                from_id=from_id,
-                to_id=to_id,
-                type=rel.type,
-            )
-            rel_count += 1
-
-        # 5. Link mentioned entities to the episode
-        for ent_id in set(name_to_entity_id.values()):
-            await self.graph.run(Q.LINK_EPISODE_ENTITY, episode_id=episode_id, entity_id=ent_id)
-
-        # 6. Facts with conflict detection
-        for fact in extraction.facts:
-            subject_id = None
-            if fact.subject_name:
-                subject_id = await self._resolve_entity_id(fact.subject_name, name_to_entity_id)
-            fact_id = new_id("fact")
-            if subject_id:
-                conflict = await self._detect_conflict(subject_id, fact.content, fact_id)
-                if conflict:
-                    conflicts.append(conflict)
-            await self.graph.run(
-                Q.CREATE_FACT,
-                id=fact_id,
-                content=fact.content,
-                subject=subject_id or "",
-                confidence=fact.confidence,
-                source_agent_id=agent_id,
-                source_session_id=session_id,
-            )
-            fact_count += 1
-
-        # 7. Embed the episode
-        embedding_status = "ok"
-        try:
-            vector = await self.embedder.embed(content[:4000])
-            await self.graph.run(Q.SET_EPISODE_EMBEDDING, episode_id=episode_id, vector=vector)
-        except Exception as exc:  # noqa: BLE001
-            embedding_status = f"failed: {exc}"
-            log.error("Episode embedding failed: %s", exc)
-
-        # 8. Embed entity summaries (for entity-level search + future dedup)
-        for ent in extraction.entities:
-            ent_id = name_to_entity_id.get(_norm_name(ent.name))
-            if not ent_id:
-                continue
-            try:
-                text = f"{ent.name} ({ent.type}): {ent.description or ent.name}"
-                vec = await self.embedder.embed(text)
-                await self.graph.run(Q.SET_ENTITY_EMBEDDING, entity_id=ent_id, vector=vec)
-            except Exception:  # noqa: BLE001
-                pass  # non-fatal
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
 
         return RememberResponse(
             episode_id=episode_id,
-            entities_created=entities_created,
-            entities_merged=entities_merged,
-            relationships_created=rel_count,
-            facts_stored=fact_count,
-            conflicts_detected=conflicts,
-            embedding_status=embedding_status,
+            processing=True,
+            status="pending",
         )
+
+    async def _process_episode(
+        self,
+        episode_id: str,
+        content: str,
+        agent_id: str,
+        session_id: str,
+        tags: list[str],
+    ) -> None:
+        """Background extraction + embedding pass for a stored episode."""
+        try:
+            # 2. Extract entities / relationships / facts
+            extraction = await self.llm.extract(
+                content, agent_id=agent_id, session_id=session_id, tags=tags
+            )
+
+            name_to_entity_id: dict[str, str] = {}
+
+            # 3. Dedup + upsert entities
+            for ent in extraction.entities:
+                # Type safety: ensure aliases is a list of strings
+                if not isinstance(ent.aliases, list):
+                    ent.aliases = []
+                ent.aliases = [str(a) for a in ent.aliases if isinstance(a, str)][:10]
+                ent_id, _merged_into = await self._upsert_entity(ent)
+                name_to_entity_id[_norm_name(ent.name)] = ent_id
+                for alias in ent.aliases:
+                    name_to_entity_id.setdefault(_norm_name(alias), ent_id)
+
+            # 4. Relationships (resolve endpoint names, creating missing entities)
+            for rel in extraction.relationships:
+                from_id = await self._resolve_entity_id(rel.from_name, name_to_entity_id)
+                to_id = await self._resolve_entity_id(rel.to_name, name_to_entity_id)
+                if not from_id or not to_id:
+                    continue
+                await self.graph.run(
+                    Q.CREATE_RELATIONSHIP_STATIC,
+                    from_id=from_id,
+                    to_id=to_id,
+                    type=rel.type,
+                )
+
+            # 5. Link mentioned entities to the episode
+            for ent_id in set(name_to_entity_id.values()):
+                await self.graph.run(Q.LINK_EPISODE_ENTITY, episode_id=episode_id, entity_id=ent_id)
+
+            # 6. Facts with conflict detection
+            for fact in extraction.facts:
+                subject_id = None
+                if fact.subject_name:
+                    subject_id = await self._resolve_entity_id(fact.subject_name, name_to_entity_id)
+                fact_id = new_id("fact")
+                if subject_id:
+                    await self._detect_conflict(subject_id, fact.content, fact_id)
+                await self.graph.run(
+                    Q.CREATE_FACT,
+                    id=fact_id,
+                    content=fact.content,
+                    subject=subject_id or "",
+                    confidence=fact.confidence,
+                    source_agent_id=agent_id,
+                    source_session_id=session_id,
+                )
+
+            # 7. Embed the episode
+            try:
+                vector = await self.embedder.embed(content[:4000])
+                await self.graph.run(Q.SET_EPISODE_EMBEDDING, episode_id=episode_id, vector=vector)
+            except Exception as exc:  # noqa: BLE001
+                log.error("Episode embedding failed: %s", exc)
+
+            # 8. Embed entity summaries (for entity-level search + future dedup)
+            for ent in extraction.entities:
+                ent_id = name_to_entity_id.get(_norm_name(ent.name))
+                if not ent_id:
+                    continue
+                try:
+                    text = f"{ent.name} ({ent.type}): {ent.description or ent.name}"
+                    vec = await self.embedder.embed(text)
+                    await self.graph.run(Q.SET_ENTITY_EMBEDDING, entity_id=ent_id, vector=vec)
+                except Exception:  # noqa: BLE001
+                    pass  # non-fatal
+
+            await self.graph.run(Q.SET_EPISODE_STATUS, episode_id=episode_id, status="processed")
+        except Exception as exc:  # noqa: BLE001
+            log.error("Background processing failed for %s: %s", episode_id, exc)
+            try:
+                await self.graph.run(Q.SET_EPISODE_STATUS, episode_id=episode_id, status="failed")
+            except Exception:  # noqa: BLE001
+                pass
+
+    async def episode_status(self, episode_id: str) -> dict:
+        row = await self.graph.run_one(Q.GET_EPISODE_STATUS, episode_id=episode_id)
+        if not row:
+            return {"episode_id": episode_id, "status": "not_found"}
+        return {
+            "episode_id": row["id"],
+            "status": row.get("status") or "processed",
+            "request_id": row.get("request_id") or "",
+        }
 
     async def _upsert_entity(self, ent) -> tuple[str, str | None]:
         """Upsert an entity with dedup. Returns (entity_id, merged_into_name|None)."""
