@@ -401,10 +401,10 @@ class MemoryEngine:
         fts_query = self._lucene_escape(query) or "*"
         try:
             fts_results = await self.graph.run(
-                Q.FULLTEXT_SEARCH_EPISODES, query=fts_query, limit=candidate_pool
+                Q.FULLTEXT_SEARCH_EPISODES, q=fts_query, limit=candidate_pool
             )
             fact_fts_results = await self.graph.run(
-                Q.FULLTEXT_SEARCH_FACTS, query=fts_query, limit=candidate_pool
+                Q.FULLTEXT_SEARCH_FACTS, q=fts_query, limit=candidate_pool
             )
         except Exception as exc:  # noqa: BLE001
             log.warning("Full-text search failed: %s", exc)

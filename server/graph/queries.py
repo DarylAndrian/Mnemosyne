@@ -203,7 +203,7 @@ RETURN node.id AS id, node.content AS content, score,
 """
 
 FULLTEXT_SEARCH_EPISODES = """
-CALL db.index.fulltext.queryNodes('memory_fulltext', $query)
+CALL db.index.fulltext.queryNodes('memory_fulltext', $q)
 YIELD node, score
 WHERE node.active = true
 RETURN node.id AS id, node.content AS content, score,
@@ -215,7 +215,7 @@ LIMIT $limit
 """
 
 FULLTEXT_SEARCH_FACTS = """
-CALL db.index.fulltext.queryNodes('fact_fulltext', $query)
+CALL db.index.fulltext.queryNodes('fact_fulltext', $q)
 YIELD node, score
 WHERE node.valid_until IS NULL
 RETURN node.id AS id, node.content AS content, score,
