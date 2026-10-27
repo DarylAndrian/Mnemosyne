@@ -33,7 +33,10 @@ Return ONLY a single valid JSON object with this exact shape:
 }}
 
 Field rules:
-- entities.type must be one of: Person, Project, Service, API, Tool, Decision, Concept, Task
+- entities.type must be one of: Person, Project, Product, Board, Identifier, Service, API, Tool, Decision, Concept, Task
+- Extract ONLY names that appear verbatim in the conversation. Never invent a person, product, board, or project.
+- Do not extract generic words (user, agent, system, memory, task, note, conversation).
+- Prefer specific products, boards, projects, people, and explicit ids over broad topics.
 - relationships.type must be one of: USES, DEPENDS_ON, INTEGRATES_WITH, MANAGED_BY, OWNED_BY, CREATED_BY, HAS_PROPERTY, HAS_BEHAVIOR, DECIDED_ON, WORKING_ON, RELATED_TO
 - facts.confidence: explicit statement = 0.95, clear inference = 0.8, guess = 0.6
 - Output ONLY the JSON object. No markdown fences, no commentary, no trailing text.
@@ -47,6 +50,11 @@ Conversation:
 
 Context: Agent={agent_id}, Session={session_id}, Tags={tags}
 """
+
+ALLOWED_ENTITY_TYPES = {
+    "Person", "Project", "Product", "Board", "Identifier", "Service", "API",
+    "Tool", "Decision", "Concept", "Task", "Topic",
+}
 
 ALLOWED_REL_TYPES = {
     "USES", "DEPENDS_ON", "INTEGRATES_WITH", "MANAGED_BY", "OWNED_BY",
@@ -83,7 +91,7 @@ class ExtractionLLM:
             if parsed is not None:
                 return self._normalize(parsed)
             last_error = f"attempt {attempt + 1}: unparseable JSON from model"
-            log.warning("Extraction %s (raw=%.120r)", last_error, raw)
+            log.warning("Extraction %s (%s chars)", last_error, len(raw or ""))
             # Nudge the model harder on retry
             prompt = (
                 "IMPORTANT: respond with ONLY the JSON object, nothing else.\n\n"
@@ -148,11 +156,17 @@ class ExtractionLLM:
                 if not isinstance(e, dict) or not e.get("name"):
                     continue
                 from ..models import EntityOut
+                raw_type = str(e.get("type", "Concept")).strip()[:50] or "Concept"
+                if raw_type not in ALLOWED_ENTITY_TYPES:
+                    raw_type = "Concept"
+                raw_aliases = e.get("aliases") or []
+                if isinstance(raw_aliases, str):
+                    raw_aliases = [raw_aliases]
                 entities.append(EntityOut(
                     name=str(e["name"]).strip()[:200],
-                    type=str(e.get("type", "Concept")).strip()[:50] or "Concept",
+                    type=raw_type,
                     description=str(e.get("description", ""))[:1000],
-                    aliases=[str(a).strip()[:200] for a in (e.get("aliases") or []) if str(a).strip()][:10],
+                    aliases=[str(a).strip()[:200] for a in raw_aliases if str(a).strip()][:10],
                 ))
             for r in data.get("relationships", []) or []:
                 if not isinstance(r, dict):

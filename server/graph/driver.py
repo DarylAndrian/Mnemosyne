@@ -23,6 +23,7 @@ class GraphDriver:
                 self._settings.neo4j_uri,
                 auth=(self._settings.neo4j_user, self._settings.neo4j_password),
                 max_connection_lifetime=60,
+                connection_timeout=5,
             )
         return self._driver
 

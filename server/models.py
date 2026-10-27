@@ -57,9 +57,13 @@ class RecallHit(BaseModel):
     kind: str  # episode | fact
     source_agent_id: Optional[str] = None
     source_session_id: Optional[str] = None
+    # Who wrote the memory (same value as source_agent_id). Always present.
+    source: Optional[str] = None
     entities: list[str] = Field(default_factory=list)
     created_at: Optional[str] = None
     still_valid: bool = True
+    # Episode id for forget(). Null on fact hits, which are not episodes.
+    episode_id: Optional[str] = None
 
 
 class RememberResponse(BaseModel):
@@ -74,5 +78,11 @@ class RememberResponse(BaseModel):
     processing: bool = False
     # True when an existing episode was returned instead of creating a new one
     deduplicated: bool = False
-    # Episode processing status: pending | processed | failed
+    # Episode processing status: pending | processed | failed | rejected
     status: str = "processed"
+    # Set when an existing keyed episode was replaced in place.
+    updated: bool = False
+    key: str = ""
+    # Set when remember refuses to store the text.
+    rejected: bool = False
+    error: str = ""

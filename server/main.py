@@ -123,6 +123,7 @@ async def remember(
     session_id: str = "",
     tags: list[str] | None = None,
     request_id: str = "",
+    key: str = "",
 ) -> dict:
     """Store a memory. Returns immediately with episode_id and
     processing=true; entity/relationship/fact extraction and embedding
@@ -140,15 +141,18 @@ async def remember(
         session_id: Optional session identifier for provenance.
         tags: Optional list of tags.
         request_id: Optional client-generated idempotency key (UUID recommended).
+        key: Optional stable key. When an active episode already has this key,
+            its content is replaced and the previous body is kept as history.
 
     Returns:
         episode_id, processing flag, and status. If deduplicated=true,
         the episode already existed and nothing new was stored.
+        Passwords, tokens, API keys, and JWTs are rejected and not stored.
     """
     # Auto-set agent_id from per-agent token if not explicitly provided
     if not agent_id:
         agent_id = current_agent_id.get() or "unknown"
-    return (await engine.remember(content, agent_id, session_id, tags, request_id)).model_dump()
+    return (await engine.remember(content, agent_id, session_id, tags, request_id, key)).model_dump()
 
 
 @mcp.tool()
@@ -161,14 +165,14 @@ async def episode_status(episode_id: str) -> dict:
         episode_id: Episode id returned by remember (starts with 'ep_').
 
     Returns:
-        Status: pending (still processing), processed (complete),
-        failed (extraction error), or not_found.
+        status (pending, processed, failed, or not_found), error_message,
+        attempts, and last_attempt_at.
     """
     return await engine.episode_status(episode_id)
 
 
 @mcp.tool()
-async def recall(query: str, top_k: int = 5, agent_id: str = "") -> dict:
+async def recall(query: str, top_k: int = 5, agent_id: str = "", mode: str = "full") -> dict:
     """Hybrid RAG search across the shared memory: vector similarity +
     keyword matching + graph neighborhood expansion, fused with recency
     and access boosts. Use before answering questions that may need
@@ -178,42 +182,53 @@ async def recall(query: str, top_k: int = 5, agent_id: str = "") -> dict:
         query: Natural language question or search phrase.
         top_k: Max results to return (1-20, default 5).
         agent_id: Optional agent identifier (for future filtering).
+        mode: "full" (default) or "snippet". Snippet returns id, score, and
+            a short excerpt around the match.
 
     Returns:
-        Ranked results with provenance, plus graph context (entities and paths).
+        Ranked results with episode_id, created_at, source, and score.
+        Full mode also includes content and graph context.
     """
-    return await engine.recall(query, top_k=top_k, agent_id=agent_id)
+    return await engine.recall(query, top_k=top_k, agent_id=agent_id, mode=mode)
 
 
 @mcp.tool()
-async def context(entity_name: str, depth_limit: int = 100) -> dict:
+async def context(entity_name: str = "", depth_limit: int = 100) -> dict:
     """Get the graph neighborhood around an entity: everything connected
     to it within 1-3 hops. Use when exploring a topic's relationships.
 
     Args:
         entity_name: Entity name (fuzzy-matched if exact name not found).
+            Omit it to load the INDEX episode and TOPIC CARD titles.
         depth_limit: Max edges to return (default 100).
 
     Returns:
-        The entity and all its edges (from -[TYPE]-> to).
+        The entity and all its edges, or the INDEX payload when no name is given.
     """
     return await engine.context(entity_name, depth_limit)
 
 
 @mcp.tool()
-async def resolve(entity_a: str, entity_b: str) -> dict:
+async def resolve(
+    entity_a: str,
+    entity_b: str,
+    fuzzy: bool = False,
+    dry_run: bool = False,
+) -> dict:
     """Merge two duplicate entities. Keeps entity_a as primary, moves all
     of entity_b's edges and facts to it, adds entity_b's name as an alias,
     then deletes entity_b.
 
     Args:
-        entity_a: Name of the entity to keep.
+        entity_a: Name of the entity to keep. Exact name match unless fuzzy is set.
         entity_b: Name of the entity to merge in and delete.
+        fuzzy: When true, allow a high-confidence fuzzy name match. Default is exact.
+        dry_run: When true, report what would merge and change nothing.
 
     Returns:
-        Merge summary with new alias list and reconnected edge count.
+        Merge summary with merge_id (for unresolve), alias list, and edge count.
     """
-    return await engine.resolve(entity_a, entity_b)
+    return await engine.resolve(entity_a, entity_b, fuzzy=fuzzy, dry_run=dry_run)
 
 
 @mcp.tool()
@@ -228,6 +243,73 @@ async def forget(memory_id: str) -> dict:
         Confirmation or error if the episode was not found.
     """
     return await engine.forget(memory_id)
+
+
+@mcp.tool()
+async def list_episodes(
+    text_contains: str = "",
+    source: str = "",
+    created_before: str = "",
+    created_after: str = "",
+    entity: str = "",
+    status: str = "",
+    limit: int = 50,
+    cursor: str = "",
+) -> dict:
+    """List active episodes. Every filter is optional.
+
+    Args:
+        text_contains: Case-insensitive substring of the episode text.
+        source: Agent or device id that wrote the episode.
+        created_before: ISO timestamp, inclusive upper bound.
+        created_after: ISO timestamp, inclusive lower bound.
+        entity: Exact entity name linked to the episode.
+        status: pending, processed, or failed.
+        limit: Page size, default 50, max 200.
+        cursor: Pass next_cursor from the previous page.
+
+    Returns:
+        id, created_at, source, status, and the first 160 characters.
+    """
+    return await engine.list_episodes(
+        text_contains=text_contains,
+        source=source,
+        created_before=created_before,
+        created_after=created_after,
+        entity=entity,
+        status=status,
+        limit=limit,
+        cursor=cursor,
+    )
+
+
+@mcp.tool()
+async def reprocess_failed(episode_ids: list[str] | None = None) -> dict:
+    """Re-queue every failed episode, or the given ids, for extraction.
+
+    Safe to run more than once. Does not delete anything. Returns ids only.
+    """
+    return await engine.reprocess_failed(episode_ids=episode_ids or None, wait=False)
+
+
+@mcp.tool()
+async def unresolve(merge_id: str) -> dict:
+    """Undo a resolve() merge. Restores both entities and their links.
+
+    Args:
+        merge_id: Id returned by resolve (starts with 'merge_').
+    """
+    return await engine.unresolve(merge_id)
+
+
+@mcp.tool()
+async def get_by_key(key: str) -> dict:
+    """Fetch the current episode for a stable key, plus older versions.
+
+    Args:
+        key: Key passed to remember, for example "topic-card:slingshot".
+    """
+    return await engine.get_by_key(key)
 
 
 # ---------------------------------------------------------------------------
