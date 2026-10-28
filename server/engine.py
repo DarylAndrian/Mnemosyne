@@ -58,6 +58,10 @@ ACCESS_BOOST_CAP = 2.0
 NEAR_DUP_TOKEN_OVERLAP = 0.97
 
 MAX_PROCESS_ATTEMPTS = 3
+# resolve() refuses to merge names below this surface similarity unless
+# fuzzy or force is set. Bigram-Jaccard over normalised names: "Slingshot
+# Results Hub" vs "Renaldi Tjahaya" scores ~0.03, real variants score 0.5+.
+MIN_RESOLVE_SIMILARITY = 0.35
 INDEX_TOKEN_BUDGET = 2000
 SNIPPET_CHARS = 200
 
@@ -97,6 +101,17 @@ def _token_overlap(a: str, b: str) -> float:
     if not ta or not tb:
         return 0.0
     return len(ta & tb) / min(len(ta), len(tb))
+
+
+def _names_look_related(a: str, b: str) -> bool:
+    """Surface-similarity gate for resolve(). Same name, any shared token, or
+    enough bigram overlap. Unrelated names (different people/places) return
+    False so resolve() refuses unless fuzzy or force is set."""
+    if _norm_name(a) == _norm_name(b):
+        return True
+    if _token_overlap(a, b) > 0:
+        return True
+    return _name_similarity(a, b) >= MIN_RESOLVE_SIMILARITY
 
 
 def _unique(items: list[str]) -> list[str]:
@@ -140,7 +155,15 @@ class MemoryEngine:
         self._bg_tasks: set[asyncio.Task] = set()
         # One extraction at a time. Parallel Ollama calls were timing out and
         # leaving episodes failed before an embedding was written.
+        #
+        # Two lanes so a burst of retries can never starve fresh saves:
+        #   _process_sem -> new episodes (attempt 1)
+        #   _retry_sem   -> retries (attempt 2+) and reprocess_failed requeues
+        # asyncio.Semaphore is FIFO, so sharing one lane meant a single
+        # reprocess_failed(28 episodes) pushed new work to the back of a
+        # 28-deep line; fresh episodes sat at "pending / attempts 0".
         self._process_sem = asyncio.Semaphore(1)
+        self._retry_sem = asyncio.Semaphore(1)
         self._retry_backoff = (2.0, 8.0, 30.0)
         self._sleep = asyncio.sleep
 
@@ -317,13 +340,24 @@ class MemoryEngine:
         agent_id: str,
         session_id: str,
         tags: list[str],
+        lane: str = "new",
     ) -> None:
-        """Background extraction + embedding. Retries up to 3 times with backoff."""
+        """Background extraction + embedding. Retries up to 3 times with backoff.
+
+        lane="new"  -> first attempt uses the fresh-episode lane
+        lane="retry"-> every attempt uses the retry lane (reprocess requeues)
+
+        Attempts after the first always move to the retry lane, so a failing
+        episode releases the fresh lane immediately instead of re-queuing in
+        front of brand new saves.
+        """
+        fresh_sem = self._process_sem if lane == "new" else self._retry_sem
         # Embed first so a later extraction error still leaves the episode searchable.
-        await self._embed_episode(episode_id, content)
+        await self._embed_episode(episode_id, content, fresh_sem)
         for attempt in range(1, MAX_PROCESS_ATTEMPTS + 1):
+            sem = fresh_sem if attempt == 1 else self._retry_sem
             try:
-                async with self._process_sem:
+                async with sem:
                     await self._extract_and_link(episode_id, content, agent_id, session_id, tags)
                     await self.graph.run(
                         Q.MARK_EPISODE_PROCESSED,
@@ -359,9 +393,11 @@ class MemoryEngine:
                 delay = self._retry_backoff[min(attempt - 1, len(self._retry_backoff) - 1)]
                 await self._sleep(delay)
 
-    async def _embed_episode(self, episode_id: str, content: str) -> None:
+    async def _embed_episode(
+        self, episode_id: str, content: str, sem: asyncio.Semaphore | None = None
+    ) -> None:
         try:
-            async with self._process_sem:
+            async with (sem or self._process_sem):
                 vector = await self.embedder.embed((content or "")[:4000])
                 await self.graph.run(Q.SET_EPISODE_EMBEDDING, episode_id=episode_id, vector=vector)
         except Exception as exc:  # noqa: BLE001
@@ -496,11 +532,24 @@ class MemoryEngine:
             missing = []
         queued: list[str] = []
         skipped: list[str] = []
+        reset: list[str] = []
         tasks = []
         for row in rows:
             if row.get("active") is False:
                 skipped.append(row["id"])
                 continue
+            # Reset BEFORE enqueueing: without this a requeued episode kept
+            # status="failed" / attempts=N / its old error_message, so callers
+            # saw "queued" but list_episodes(status="failed") never changed.
+            try:
+                await self.graph.run(Q.RESET_EPISODE_FOR_REPROCESS, episode_id=row["id"])
+                reset.append(row["id"])
+            except Exception as exc:  # noqa: BLE001
+                log.error(
+                    "Could not reset %s for reprocess: %s",
+                    row["id"],
+                    type(exc).__name__,
+                )
             queued.append(row["id"])
             tags = row.get("tags") or []
             if isinstance(tags, str):
@@ -513,12 +562,18 @@ class MemoryEngine:
                         row.get("source_agent_id") or "",
                         row.get("source_session_id") or "",
                         tags,
+                        lane="retry",
                     )
                 )
             )
         if wait and tasks:
             await asyncio.gather(*tasks)
-        result: dict = {"queued": queued, "missing": missing, "skipped": skipped}
+        result: dict = {
+            "queued": queued,
+            "reset": reset,
+            "missing": missing,
+            "skipped": skipped,
+        }
         if wait:
             result["results"] = [await self.episode_status(eid) for eid in queued]
         return result
@@ -955,6 +1010,7 @@ class MemoryEngine:
         entity_b: str,
         fuzzy: bool = False,
         dry_run: bool = False,
+        force: bool = False,
     ) -> dict:
         a, cands_a = await self._find_for_resolve(entity_a, fuzzy)
         b, cands_b = await self._find_for_resolve(entity_b, fuzzy)
@@ -968,6 +1024,29 @@ class MemoryEngine:
             }
         if a["id"] == b["id"]:
             return {"merged": False, "dry_run": dry_run, "error": "both names resolve to the same entity"}
+
+        # Guard: refuse clearly-unrelated names unless fuzzy or force is set.
+        # resolve() deletes entity_b, so a bad call is destructive - dry_run
+        # previously reported would_merge=true for e.g. "Slingshot Results Hub"
+        # vs "Renaldi Tjahaya".
+        if not (fuzzy or force) and not _names_look_related(a["name"], b["name"]):
+            sim = _name_similarity(a["name"], b["name"])
+            tok = _token_overlap(a["name"], b["name"])
+            warning = (
+                f"'{a['name']}' and '{b['name']}' look unrelated "
+                f"(similarity {sim:.2f}, token overlap {tok:.2f}) - refusing to merge. "
+                "Pass force=true to merge anyway, or fuzzy=true if this is a loose match."
+            )
+            if dry_run:
+                return {
+                    "merged": False,
+                    "dry_run": True,
+                    "would_merge": False,
+                    "warning": warning,
+                    "kept": a["name"],
+                    "dropped": b["name"],
+                }
+            return {"merged": False, "dry_run": False, "error": warning}
 
         state_a = await self._load_entity_state(a)
         state_b = await self._load_entity_state(b)
@@ -1239,7 +1318,8 @@ class MemoryEngine:
             extraction = ExtractionResult()
             if use_llm:
                 try:
-                    async with self._process_sem:
+                    # Retry lane: a long backfill must never block fresh saves.
+                    async with self._retry_sem:
                         extraction = await self.llm.extract(content, agent_id="backfill")
                 except Exception as exc:  # noqa: BLE001
                     failures += 1

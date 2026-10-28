@@ -332,9 +332,19 @@ MATCH (e:Entity {id: $id})
 OPTIONAL MATCH (e)-[:MENTIONED_IN]->(ep:Episode)
 WHERE coalesce(ep.active, true) = true
 WITH count(ep) AS linked
-MATCH (all:Episode)
-WHERE coalesce(all.active, true) = true
-RETURN linked, count(all) AS total
+MATCH (tot:Episode)
+WHERE coalesce(tot.active, true) = true
+RETURN linked, count(tot) AS total
+"""
+
+RESET_EPISODE_FOR_REPROCESS = """
+MATCH (ep:Episode {id: $episode_id})
+SET ep.status = 'pending',
+    ep.attempts = 0,
+    ep.error_message = '',
+    ep.last_attempt_at = null,
+    ep.updated_at = datetime()
+RETURN ep.id AS id, coalesce(ep.attempts, 0) AS attempts, coalesce(ep.status, 'pending') AS status
 """
 
 EPISODE_ENTITY_NAMES = """

@@ -217,7 +217,10 @@ async def test_merge_then_unresolve_restores_state():
         source_agent_id="t", source_session_id="", episode_id="ep_b",
     )
 
-    dry = await engine.resolve("Alpha", "Beta", dry_run=True)
+    # "Alpha" and "Beta" are unrelated fixture names, so resolve() now refuses
+    # them by default (see MIN_RESOLVE_SIMILARITY) - these calls assert the
+    # merge mechanics, so they opt in with force=True.
+    dry = await engine.resolve("Alpha", "Beta", dry_run=True, force=True)
     assert dry["dry_run"] is True and dry["would_merge"] is True
     assert dry["merge_preview"]["episodes"] == ["ep_b"]
     assert "ent_b" in graph.entities
@@ -226,7 +229,12 @@ async def test_merge_then_unresolve_restores_state():
     merged = await engine.resolve("HOKI Rewards", "Alpha")
     assert merged["merged"] is False
 
-    merged = await engine.resolve("Alpha", "Beta")
+    # Without force the unrelated pair must be refused...
+    refused = await engine.resolve("Alpha", "Beta")
+    assert refused["merged"] is False
+    assert "unrelated" in (refused.get("error") or "")
+
+    merged = await engine.resolve("Alpha", "Beta", force=True)
     assert merged["merged"] is True
     assert merged["merge_id"].startswith("merge_")
     assert "ent_b" not in graph.entities

@@ -214,6 +214,7 @@ async def resolve(
     entity_b: str,
     fuzzy: bool = False,
     dry_run: bool = False,
+    force: bool = False,
 ) -> dict:
     """Merge two duplicate entities. Keeps entity_a as primary, moves all
     of entity_b's edges and facts to it, adds entity_b's name as an alias,
@@ -224,11 +225,17 @@ async def resolve(
         entity_b: Name of the entity to merge in and delete.
         fuzzy: When true, allow a high-confidence fuzzy name match. Default is exact.
         dry_run: When true, report what would merge and change nothing.
+        force: When true, merge even if the two names look unrelated. By default
+            a merge is refused (and dry_run reports would_merge=false) when the
+            names share no tokens and have low similarity, since entity_b is
+            deleted. Set fuzzy or force to override.
 
     Returns:
         Merge summary with merge_id (for unresolve), alias list, and edge count.
     """
-    return await engine.resolve(entity_a, entity_b, fuzzy=fuzzy, dry_run=dry_run)
+    return await engine.resolve(
+        entity_a, entity_b, fuzzy=fuzzy, dry_run=dry_run, force=force
+    )
 
 
 @mcp.tool()
