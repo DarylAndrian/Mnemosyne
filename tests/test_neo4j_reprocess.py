@@ -185,11 +185,12 @@ async def test_retry_lane_runs_while_fresh_lane_is_busy():
             engine._process_episode(ep_id, CONTENT, "integration-test", "", [], lane="retry"),
             timeout=30,
         )
+        st = await engine.episode_status(ep_id)
+        assert st["status"] == "processed", st
     finally:
         engine._process_sem.release()
-
-    st = await engine.episode_status(ep_id)
-    assert st["status"] == "processed", st
+        await _cleanup(graph, [ep_id])
+        await engine.close()
 
 
 async def test_fresh_lane_is_actually_blocked():
@@ -229,21 +230,23 @@ async def test_failing_fresh_episode_hands_off_to_retry_lane():
 
     engine._extract_and_link = spy
 
-    await engine._process_episode(ep_id, CONTENT, "integration-test", "", [], lane="new")
+    try:
+        await engine._process_episode(ep_id, CONTENT, "integration-test", "", [], lane="new")
 
-    st = await engine.episode_status(ep_id)
-    assert st["status"] == "processed", st
-    assert st["attempts"] == 2, st
-    assert st["error_message"] == "", st
+        st = await engine.episode_status(ep_id)
+        assert st["status"] == "processed", st
+        assert st["attempts"] == 2, st
+        assert st["error_message"] == "", st
 
-    assert len(observed) == 2, f"expected 2 attempts, observed {observed}"
-    fresh_held, retry_held = observed[0]
-    assert fresh_held and not retry_held, f"attempt 1 must use fresh lane: {observed}"
-    fresh_held, retry_held = observed[1]
-    assert retry_held and not fresh_held, f"attempt 2 must use retry lane: {observed}"
-
-    await _cleanup(graph, [ep_id])
-    await engine.close()
+        assert len(observed) == 2, f"expected 2 attempts, observed {observed}"
+        fresh_held, retry_held = observed[0]
+        assert fresh_held and not retry_held, f"attempt 1 must use fresh lane: {observed}"
+        fresh_held, retry_held = observed[1]
+        assert retry_held and not fresh_held, f"attempt 2 must use retry lane: {observed}"
+    finally:
+        # Always drop the fixture - leaking ep_test_* rows pollutes the graph.
+        await _cleanup(graph, [ep_id])
+        await engine.close()
 
 
 # ---------------------------------------------------------------------------
