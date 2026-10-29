@@ -47,7 +47,10 @@ class FakeGraph:
         self.entities: dict[str, dict] = {}
         self.facts: dict[str, dict] = {}
         self.rels: list[tuple[str, str, str]] = []
+        self.rel_sources: dict[tuple[str, str, str], set[str]] = {}
+        self.rel_target: dict[tuple[str, str, str], str | None] = {}
         self.mentions: set[tuple[str, str]] = set()
+        self.mention_target: dict[tuple[str, str], str | None] = {}
         self.versions: list[dict] = []
         self.merges: dict[str, dict] = {}
         self.embeddings: dict[str, list] = {}
@@ -220,8 +223,11 @@ class FakeGraph:
             ]
             return rows[: params.get("limit") or 1000]
         if query == Q.CLEAR_EPISODE_LINKS:
-            self.mentions = {pair for pair in self.mentions if pair[1] != params["episode_id"]}
-            return [{"deleted": 0}]
+            removed = {pair for pair in self.mentions if pair[1] == params["episode_id"]}
+            self.mentions -= removed
+            for pair in removed:
+                self.mention_target.pop(pair, None)
+            return [{"deleted": len(removed)}]
         if query == Q.DELETE_EPISODE_FACTS:
             self.facts = {
                 fid: fact for fid, fact in self.facts.items()
@@ -278,18 +284,33 @@ class FakeGraph:
                 return []
             return [{"linked": linked, "total": total}]
         if query == Q.LINK_EPISODE_ENTITY:
+            pair = (params["entity_id"], params["episode_id"])
             if params["entity_id"] in self.entities and params["episode_id"] in self.episodes:
-                self.mentions.add((params["entity_id"], params["episode_id"]))
-            return [{"id": params["entity_id"]}]
+                self.mentions.add(pair)
+                self.mention_target[pair] = params["episode_id"]
+                ent = self.entities[params["entity_id"]]
+                if not ent.get("source_episode_id"):
+                    ent["source_episode_id"] = params["episode_id"]
+            return [{"id": params["entity_id"], "target": params["episode_id"]}]
         if query == Q.UNLINK_EPISODE_ENTITY:
-            self.mentions.discard((params["entity_id"], params["episode_id"]))
+            pair = (params["entity_id"], params["episode_id"])
+            self.mentions.discard(pair)
+            self.mention_target.pop(pair, None)
             return [{"deleted": 1}]
         if query == Q.CREATE_RELATIONSHIP_STATIC:
             if params["from_id"] in self.entities and params["to_id"] in self.entities:
                 rel = (params["from_id"], params["type"], params["to_id"])
                 if rel not in self.rels:
                     self.rels.append(rel)
+                if params["type"] != "MENTIONED_IN":
+                    self.rel_target[rel] = params["to_id"]
             return [{"done": 1}]
+        if query == Q.STAMP_RELATIONSHIP:
+            rel = (params["from_id"], params["rel_type"], params["to_id"])
+            if rel in self.rels and params.get("episode_id"):
+                self.rel_sources.setdefault(rel, set()).add(params["episode_id"])
+                self.rel_target[rel] = params["to_id"]
+            return [{"stamped": 1 if rel in self.rels else 0}]
         if query == Q.DELETE_RELATIONSHIP:
             before = len(self.rels)
             self.rels = [
@@ -537,9 +558,244 @@ class FakeGraph:
                 return []
             ep["active"] = False
             return [{"id": ep["id"]}]
+        handled = self._run_connectivity(query, params)
+        if handled is not None:
+            return handled
         if query == Q.ENTITY_NEIGHBORHOOD:
             return []
         raise AssertionError("unexpected query: " + " ".join(query.split())[:80])
+
+    def _degree(self, node_id: str) -> int:
+        degree = sum(1 for ent_id, ep_id in self.mentions if node_id in (ent_id, ep_id))
+        degree += sum(1 for src, _rel, dst in self.rels if node_id in (src, dst))
+        return degree
+
+    def _active_mentions(self, entity_id: str) -> set[str]:
+        return {
+            ep_id
+            for ent_id, ep_id in self.mentions
+            if ent_id == entity_id and self.episodes.get(ep_id, {}).get("active", True)
+        }
+
+    def _orphan_rows(self, max_degree: int) -> list[dict]:
+        rows = []
+        nodes: list[tuple[str, str]] = [("entity", ent_id) for ent_id in self.entities]
+        nodes += [("episode", ep_id) for ep_id in self.episodes]
+        for kind, node_id in nodes:
+            degree = self._degree(node_id)
+            if degree > max_degree:
+                continue
+            if kind == "entity":
+                ent = self.entities[node_id]
+                mentioned = next((ep_id for ent_id, ep_id in self.mentions if ent_id == node_id), "")
+                rows.append({
+                    "id": node_id,
+                    "name": ent.get("name") or node_id,
+                    "type": ent.get("type") or "Entity",
+                    "source_episode_id": ent.get("source_episode_id") or mentioned or "",
+                    "degree": degree,
+                })
+            else:
+                ep = self.episodes[node_id]
+                rows.append({
+                    "id": node_id,
+                    "name": ep.get("key") or (ep.get("summary") or ep.get("content") or node_id)[:80],
+                    "type": "Episode",
+                    "source_episode_id": node_id,
+                    "degree": degree,
+                })
+        rows.sort(key=lambda row: (row["name"], row["id"]))
+        return rows
+
+    def _run_connectivity(self, query: str, params: dict) -> list[dict] | None:
+        if query == Q.GET_EPISODE_BRIEF:
+            ep = self.episodes.get(params["episode_id"])
+            if not ep:
+                return []
+            return [{
+                "id": ep["id"],
+                "key": ep.get("key") or "",
+                "content_head": (ep.get("content") or "")[:80],
+                "active": ep.get("active", True),
+            }]
+        if query == Q.LIST_PENDING_IDS:
+            ids = [
+                {"id": ep["id"]}
+                for ep in self.episodes.values()
+                if ep.get("active", True) and (ep.get("status") or "") == "pending"
+            ]
+            return ids[: params.get("limit") or 500]
+        if query == Q.INVALIDATE_EPISODE_FACTS:
+            n = 0
+            for fact in self.facts.values():
+                if fact.get("source_episode_id") == params["episode_id"] and fact.get("valid_until") is None:
+                    fact["valid_until"] = self._now()
+                    fact["superseded_by"] = "forgotten"
+                    n += 1
+            return [{"invalidated": n}]
+        if query == Q.ENTITY_IDS_ONLY_ON_EPISODE:
+            episode_id = params["episode_id"]
+            rows = []
+            for ent_id in self.entities:
+                eps = [ep_id for linked, ep_id in self.mentions if linked == ent_id]
+                if episode_id not in eps:
+                    continue
+                other = [
+                    ep_id for ep_id in eps
+                    if ep_id != episode_id and self.episodes.get(ep_id, {}).get("active", True)
+                ]
+                if not other:
+                    rows.append({"id": ent_id})
+            return rows
+        if query == Q.DROP_PROVENANCE_EDGES:
+            episode_id = params["episode_id"]
+            kept = []
+            deleted = 0
+            for rel in self.rels:
+                sources = set(self.rel_sources.get(rel) or ())
+                if episode_id not in sources:
+                    kept.append(rel)
+                    continue
+                sources.discard(episode_id)
+                alive = {
+                    ep_id for ep_id in sources
+                    if self.episodes.get(ep_id, {}).get("active", True)
+                }
+                if alive:
+                    self.rel_sources[rel] = alive
+                    kept.append(rel)
+                else:
+                    self.rel_sources.pop(rel, None)
+                    self.rel_target.pop(rel, None)
+                    deleted += 1
+            self.rels = kept
+            return [{"deleted": deleted}]
+        if query == Q.PURGE_STALE_EDGES:
+            kept = []
+            deleted = 0
+            for rel in self.rels:
+                src, rel_type, dst = rel
+                if rel_type == "MENTIONED_IN" or self.rel_sources.get(rel):
+                    kept.append(rel)
+                    continue
+                if self._active_mentions(src) and self._active_mentions(dst):
+                    kept.append(rel)
+                    continue
+                self.rel_target.pop(rel, None)
+                deleted += 1
+            self.rels = kept
+            return [{"deleted": deleted}]
+        if query == Q.DELETE_ISOLATED_ENTITIES:
+            deleted = 0
+            for ent_id in params.get("ids") or []:
+                if ent_id in self.entities and self._degree(ent_id) == 0:
+                    self.entities.pop(ent_id, None)
+                    deleted += 1
+            return [{"deleted": deleted}]
+        if query == Q.DELETE_EDGES_BETWEEN_NAMES:
+            left = (params.get("left") or "").lower()
+            right = (params.get("right") or "").lower()
+            names = {ent["id"]: (ent.get("name") or "").lower() for ent in self.entities.values()}
+            kept = []
+            deleted = 0
+            for rel in self.rels:
+                src_name = names.get(rel[0], "")
+                dst_name = names.get(rel[2], "")
+                pair = {src_name, dst_name}
+                if pair == {left, right}:
+                    self.rel_sources.pop(rel, None)
+                    self.rel_target.pop(rel, None)
+                    deleted += 1
+                else:
+                    kept.append(rel)
+            self.rels = kept
+            return [{"deleted": deleted}]
+        if query == Q.DELETE_INACTIVE_MENTIONS_BY_NAME:
+            name = (params.get("name") or "").lower()
+            removed = []
+            for ent_id, ep_id in list(self.mentions):
+                ent = self.entities.get(ent_id) or {}
+                ep = self.episodes.get(ep_id) or {}
+                if (ent.get("name") or "").lower() == name and not ep.get("active", True):
+                    removed.append((ent_id, ep_id))
+            for pair in removed:
+                self.mentions.discard(pair)
+                self.mention_target.pop(pair, None)
+            return [{"deleted": len(removed)}]
+        if query == Q.DELETE_ISOLATED_ENTITY_BY_NAME:
+            name = (params.get("name") or "").lower()
+            deleted = 0
+            for ent_id, ent in list(self.entities.items()):
+                if (ent.get("name") or "").lower() == name and self._degree(ent_id) == 0:
+                    self.entities.pop(ent_id, None)
+                    deleted += 1
+            return [{"deleted": deleted}]
+        if query == Q.BACKFILL_MENTIONED_TARGETS:
+            repaired = 0
+            for pair in list(self.mentions):
+                ent_id, ep_id = pair
+                if ep_id not in self.episodes:
+                    continue
+                if self.mention_target.get(pair) != ep_id:
+                    self.mention_target[pair] = ep_id
+                    repaired += 1
+                ent = self.entities.get(ent_id)
+                if ent is not None and not ent.get("source_episode_id"):
+                    ent["source_episode_id"] = ep_id
+            return [{"repaired": repaired}]
+        if query == Q.LIST_DANGLING_MENTIONED:
+            rows = []
+            for pair in self.mentions:
+                ent_id, ep_id = pair
+                target = self.mention_target.get(pair)
+                if target == ep_id and ep_id:
+                    continue
+                ent = self.entities.get(ent_id) or {}
+                rows.append({
+                    "from_id": ent_id,
+                    "to_id": ep_id or "",
+                    "to_is_episode": ep_id in self.episodes,
+                    "source_episode_id": ent.get("source_episode_id") or "",
+                })
+            for src, rel_type, dst in self.rels:
+                if rel_type != "MENTIONED_IN":
+                    continue
+                ent = self.entities.get(src) or {}
+                rows.append({
+                    "from_id": src,
+                    "to_id": dst or "",
+                    "to_is_episode": False,
+                    "source_episode_id": ent.get("source_episode_id") or "",
+                })
+            return rows[:5000]
+        if query == Q.CLEAR_BROKEN_MENTION:
+            from_id = params["from_id"]
+            removed = [
+                pair for pair in self.mentions
+                if pair[0] == from_id and self.mention_target.get(pair) != pair[1]
+            ]
+            for pair in removed:
+                self.mentions.discard(pair)
+                self.mention_target.pop(pair, None)
+            kept = []
+            for rel in self.rels:
+                if rel[0] == from_id and rel[1] == "MENTIONED_IN":
+                    self.rel_sources.pop(rel, None)
+                    self.rel_target.pop(rel, None)
+                else:
+                    kept.append(rel)
+            self.rels = kept
+            return [{"deleted": len(removed)}]
+        if query == Q.COUNT_NULL_MENTION_TARGETS:
+            n = sum(1 for pair in self.mentions if self.mention_target.get(pair) in (None, ""))
+            n += sum(1 for rel in self.rels if rel[1] == "MENTIONED_IN" and not self.rel_target.get(rel))
+            return [{"n": n}]
+        if query == Q.LIST_ORPHANS:
+            rows = self._orphan_rows(int(params.get("max_degree") or 0))
+            return rows[: params.get("limit") or 5000]
+        if query == Q.COUNT_ORPHANS:
+            return [{"n": len(self._orphan_rows(int(params.get("max_degree") or 0)))}]
+        return None
 
 
 async def make_engine(llm: FakeLLM | None = None) -> tuple[MemoryEngine, FakeGraph, FakeLLM]:

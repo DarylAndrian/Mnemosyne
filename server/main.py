@@ -291,6 +291,20 @@ async def list_episodes(
 
 
 @mcp.tool()
+async def list_orphans(include_single_edge: bool = False, limit: int = 5000) -> dict:
+    """List graph nodes that have no edges.
+
+    Args:
+        include_single_edge: When true, also include nodes with exactly one edge.
+        limit: Max rows to return (the count field is the full total).
+
+    Returns:
+        count plus id, name, type, source_episode_id, and degree for each node.
+    """
+    return await engine.list_orphans(include_single_edge=include_single_edge, limit=limit)
+
+
+@mcp.tool()
 async def reprocess_failed(episode_ids: list[str] | None = None) -> dict:
     """Re-queue every failed episode, or the given ids, for extraction.
 
@@ -446,23 +460,37 @@ async def _mount_api(app):
             seen = set()
             for er in edge_rows:
                 fid, tid, typ = er.get("from_id"), er.get("to_id"), er.get("rel_type") or "RELATED_TO"
-                key = (fid, tid, typ)
+                target = er.get("target") or tid
+                if not fid or not target:
+                    continue
+                key = (fid, target, typ)
                 if key in seen:
                     continue
                 seen.add(key)
-                edges.append({"id": f"{fid}->{typ}->{tid}", "from": fid, "to": tid, "label": typ})
+                edges.append({
+                    "id": f"{fid}->{typ}->{target}",
+                    "from": fid,
+                    "to": target,
+                    "source": fid,
+                    "target": target,
+                    "label": typ,
+                })
 
         # Optionally add Episode nodes (lightweight)
         if include_episodes:
             try:
                 ep_rows = await engine.graph.run(
-                    "MATCH (ep:Episode) WHERE ep.active = true "
+                    "MATCH (ep:Episode) WHERE coalesce(ep.active, true) = true "
                     "RETURN ep.id AS id, ep.summary AS summary, ep.content AS content, ep.tags AS tags "
                     "ORDER BY ep.created_at DESC LIMIT $limit",
                     limit=min(limit, 100),
                 )
+                ep_ids = []
                 for er in ep_rows:
                     eid = er.get("id")
+                    if not eid:
+                        continue
+                    ep_ids.append(eid)
                     nodes.append({
                         "id": eid,
                         "label": (er.get("summary") or er.get("content") or eid)[:40],
@@ -472,15 +500,51 @@ async def _mount_api(app):
                         "access_count": 0,
                         "group": "Episode",
                     })
-                # Episode-entity links
-                if ep_rows:
+                # Episode-entity links. Pull in mentioned entities that fell
+                # outside the first page so an episode node is not left dangling.
+                if ep_ids:
+                    extra_ents = await engine.graph.run(
+                        "MATCH (e:Entity)-[r:MENTIONED_IN]->(ep:Episode) "
+                        "WHERE ep.id IN $ep_ids AND e.id IS NOT NULL "
+                        "RETURN DISTINCT e.id AS id, e.name AS name, e.type AS type, "
+                        "e.description AS description, e.aliases AS aliases LIMIT $limit",
+                        ep_ids=ep_ids, limit=limit,
+                    )
+                    for r in extra_ents:
+                        nid = r.get("id")
+                        if not nid or nid in id_to_name:
+                            continue
+                        name = r.get("name") or nid
+                        id_to_name[nid] = name
+                        nodes.append({
+                            "id": nid,
+                            "label": name,
+                            "type": r.get("type") or "Concept",
+                            "description": r.get("description") or "",
+                            "aliases": r.get("aliases") or [],
+                            "access_count": 0,
+                            "group": r.get("type") or "Concept",
+                        })
                     link_rows = await engine.graph.run(
-                        "MATCH (e:Entity)-[:MENTIONED_IN]->(ep:Episode) "
-                        "WHERE e.id IN $ids RETURN e.id AS from_id, ep.id AS to_id LIMIT $limit",
-                        ids=list(id_to_name.keys()), limit=limit,
+                        "MATCH (e:Entity)-[r:MENTIONED_IN]->(ep:Episode) "
+                        "WHERE ep.id IN $ep_ids AND e.id IS NOT NULL AND ep.id IS NOT NULL "
+                        "RETURN e.id AS from_id, ep.id AS to_id, coalesce(r.target, ep.id) AS target "
+                        "LIMIT $limit",
+                        ep_ids=ep_ids, limit=max(limit, 500),
                     )
                     for lr in link_rows:
-                        edges.append({"id": f"{lr['from_id']}->MENTIONED_IN->{lr['to_id']}", "from": lr["from_id"], "to": lr["to_id"], "label": "MENTIONED_IN"})
+                        fid = lr.get("from_id")
+                        tid = lr.get("target") or lr.get("to_id")
+                        if not fid or not tid:
+                            continue
+                        edges.append({
+                            "id": f"{fid}->MENTIONED_IN->{tid}",
+                            "from": fid,
+                            "to": tid,
+                            "source": fid,
+                            "target": tid,
+                            "label": "MENTIONED_IN",
+                        })
             except Exception:
                 pass
 
@@ -528,6 +592,17 @@ async def _mount_api(app):
         data = await engine.recall(q, top_k=top_k)
         return _cors(JSONResponse(data))
 
+    async def api_orphans(request: Request):
+        include_single = request.query_params.get("include_single_edge", "false").lower() in ("1", "true", "yes")
+        try:
+            limit = int(request.query_params.get("limit", "5000"))
+        except ValueError:
+            limit = 5000
+        if not await engine.graph.ping():
+            return _cors(JSONResponse({"orphans": [], "count": 0, "error": "neo4j unreachable"}, status_code=503))
+        data = await engine.list_orphans(include_single_edge=include_single, limit=limit)
+        return _cors(JSONResponse(data))
+
     async def api_episodes(request: Request):
         try:
             limit = int(request.query_params.get("limit", "20"))
@@ -549,11 +624,13 @@ async def _mount_api(app):
         Route("/api/entity", api_entity, methods=["GET", "OPTIONS"]),
         Route("/api/recall", api_recall, methods=["GET", "OPTIONS"]),
         Route("/api/episodes", api_episodes, methods=["GET", "OPTIONS"]),
+        Route("/api/orphans", api_orphans, methods=["GET", "OPTIONS"]),
         Route("/api/graph", _options, methods=["OPTIONS"]),
         Route("/api/stats", _options, methods=["OPTIONS"]),
         Route("/api/entity", _options, methods=["OPTIONS"]),
         Route("/api/recall", _options, methods=["OPTIONS"]),
         Route("/api/episodes", _options, methods=["OPTIONS"]),
+        Route("/api/orphans", _options, methods=["OPTIONS"]),
     ]
     for r in reversed(routes):
         app.routes.insert(0, r)
@@ -617,6 +694,11 @@ async def _startup_checks() -> None:
     else:
         summary = await ensure_schema(engine.graph)
         log.info("Neo4j schema ensured: %s", summary)
+        try:
+            pending = await engine.resume_pending()
+            log.info("Requeued pending episodes: %s", len(pending.get("queued") or []))
+        except Exception as exc:  # noqa: BLE001
+            log.error("Could not resume pending episodes: %s", type(exc).__name__)
 
     if not await engine.embedder.health():
         log.error("Ollama unreachable at %s -- is ollama running?", settings.ollama_url)

@@ -495,8 +495,191 @@ RETURN count(*) AS done
 
 LINK_EPISODE_ENTITY = """
 MATCH (ep:Episode {id: $episode_id}), (e:Entity {id: $entity_id})
-MERGE (e)-[:MENTIONED_IN]->(ep)
-RETURN e.id AS id
+MERGE (e)-[r:MENTIONED_IN]->(ep)
+SET r.source = e.id,
+    r.target = ep.id,
+    r.source_episode_id = ep.id,
+    e.source_episode_id = coalesce(e.source_episode_id, $episode_id)
+RETURN e.id AS id, r.target AS target
+"""
+
+# Existing episode-ended MENTIONED_IN edges were stored with no target property,
+# so readers saw target = null and could not attach the episode node.
+BACKFILL_MENTIONED_TARGETS = """
+MATCH (e:Entity)-[r:MENTIONED_IN]->(ep:Episode)
+WHERE ep.id IS NOT NULL AND (r.target IS NULL OR r.target <> ep.id)
+SET r.source = e.id,
+    r.target = ep.id,
+    r.source_episode_id = coalesce(r.source_episode_id, ep.id),
+    e.source_episode_id = coalesce(e.source_episode_id, ep.id)
+RETURN count(r) AS repaired
+"""
+
+LIST_DANGLING_MENTIONED = """
+MATCH (a:Entity)-[r:MENTIONED_IN]->(b)
+WHERE b.id IS NULL OR r.target IS NULL OR NOT b:Episode OR r.target <> b.id
+RETURN a.id AS from_id,
+       coalesce(b.id, '') AS to_id,
+       b:Episode AS to_is_episode,
+       coalesce(a.source_episode_id, '') AS source_episode_id
+LIMIT 5000
+"""
+
+CLEAR_BROKEN_MENTION = """
+MATCH (a:Entity {id: $from_id})-[r:MENTIONED_IN]->(b)
+WHERE b.id IS NULL OR r.target IS NULL OR NOT b:Episode OR r.target <> b.id
+WITH collect(r) AS rels
+FOREACH (rel IN rels | DELETE rel)
+RETURN size(rels) AS deleted
+"""
+
+COUNT_NULL_MENTION_TARGETS = """
+MATCH ()-[r:MENTIONED_IN]->(n)
+WHERE r.target IS NULL OR n.id IS NULL
+RETURN count(r) AS n
+"""
+
+STAMP_RELATIONSHIP = """
+MATCH (a {id: $from_id})-[r]->(b {id: $to_id})
+WHERE type(r) = $rel_type AND type(r) <> 'MENTIONED_IN'
+SET r.source = a.id,
+    r.target = b.id,
+    r.source_episode_ids = CASE
+      WHEN $episode_id = '' OR $episode_id IN coalesce(r.source_episode_ids, [])
+        THEN coalesce(r.source_episode_ids, [])
+      ELSE coalesce(r.source_episode_ids, []) + $episode_id
+    END
+RETURN count(r) AS stamped
+"""
+
+GET_EPISODE_BRIEF = """
+MATCH (ep:Episode {id: $episode_id})
+RETURN ep.id AS id,
+       coalesce(ep.key, '') AS key,
+       substring(coalesce(ep.content, ''), 0, 80) AS content_head,
+       coalesce(ep.active, true) AS active
+"""
+
+LIST_PENDING_IDS = """
+MATCH (ep:Episode)
+WHERE coalesce(ep.active, true) = true AND coalesce(ep.status, '') = 'pending'
+RETURN ep.id AS id
+LIMIT $limit
+"""
+
+INVALIDATE_EPISODE_FACTS = """
+MATCH (f:Fact {source_episode_id: $episode_id})
+WHERE f.valid_until IS NULL
+SET f.valid_until = datetime(), f.superseded_by = 'forgotten'
+RETURN count(f) AS invalidated
+"""
+
+ENTITY_IDS_ONLY_ON_EPISODE = """
+MATCH (e:Entity)-[:MENTIONED_IN]->(ep:Episode {id: $episode_id})
+WHERE NOT EXISTS {
+  MATCH (e)-[:MENTIONED_IN]->(other:Episode)
+  WHERE other.id <> $episode_id AND coalesce(other.active, true) = true
+}
+RETURN DISTINCT e.id AS id
+"""
+
+DROP_PROVENANCE_EDGES = """
+MATCH ()-[r]->()
+WHERE $episode_id IN coalesce(r.source_episode_ids, [])
+WITH r, [x IN coalesce(r.source_episode_ids, []) WHERE x <> $episode_id] AS rest
+UNWIND CASE WHEN size(rest) = 0 THEN [null] ELSE rest END AS candidate
+OPTIONAL MATCH (ep:Episode {id: candidate})
+WHERE coalesce(ep.active, true) = true
+WITH r, [x IN collect(DISTINCT ep.id) WHERE x IS NOT NULL] AS alive
+SET r.source_episode_ids = alive
+WITH r, alive
+WHERE size(alive) = 0
+WITH collect(r) AS rels
+FOREACH (rel IN rels | DELETE rel)
+RETURN size(rels) AS deleted
+"""
+
+PURGE_STALE_EDGES = """
+MATCH (a:Entity)-[r]->(b:Entity)
+WHERE type(r) <> 'MENTIONED_IN'
+  AND size(coalesce(r.source_episode_ids, [])) = 0
+  AND (
+    NOT EXISTS {
+      MATCH (a)-[:MENTIONED_IN]->(ep:Episode)
+      WHERE coalesce(ep.active, true) = true
+    }
+    OR NOT EXISTS {
+      MATCH (b)-[:MENTIONED_IN]->(ep:Episode)
+      WHERE coalesce(ep.active, true) = true
+    }
+  )
+WITH collect(r) AS rels
+FOREACH (rel IN rels | DELETE rel)
+RETURN size(rels) AS deleted
+"""
+
+DELETE_EDGES_BETWEEN_NAMES = """
+MATCH (a:Entity)-[r]-(b:Entity)
+WHERE toLower(a.name) = toLower($left) AND toLower(b.name) = toLower($right)
+WITH collect(DISTINCT r) AS rels
+FOREACH (rel IN rels | DELETE rel)
+RETURN size(rels) AS deleted
+"""
+
+DELETE_INACTIVE_MENTIONS_BY_NAME = """
+MATCH (e:Entity)-[r:MENTIONED_IN]->(ep:Episode)
+WHERE toLower(e.name) = toLower($name) AND coalesce(ep.active, true) = false
+WITH collect(r) AS rels
+FOREACH (rel IN rels | DELETE rel)
+RETURN size(rels) AS deleted
+"""
+
+DELETE_ISOLATED_ENTITY_BY_NAME = """
+MATCH (e:Entity)
+WHERE toLower(e.name) = toLower($name) AND NOT (e)--()
+WITH collect(e) AS nodes
+FOREACH (n IN nodes | DETACH DELETE n)
+RETURN size(nodes) AS deleted
+"""
+
+DELETE_ISOLATED_ENTITIES = """
+MATCH (e:Entity)
+WHERE e.id IN $ids AND NOT (e)--()
+WITH collect(e) AS nodes
+FOREACH (n IN nodes | DETACH DELETE n)
+RETURN size(nodes) AS deleted
+"""
+
+LIST_ORPHANS = """
+MATCH (n)
+WHERE n:Entity OR n:Episode
+OPTIONAL MATCH (n)-[r]-()
+WITH n, count(r) AS degree
+WHERE degree <= $max_degree
+OPTIONAL MATCH (n)-[:MENTIONED_IN]->(ep:Episode)
+WITH n, degree, head(collect(DISTINCT ep.id)) AS mentioned_ep
+RETURN n.id AS id,
+       CASE
+         WHEN n:Episode THEN coalesce(n.key, substring(coalesce(n.summary, n.content, n.id), 0, 80))
+         ELSE coalesce(n.name, n.id)
+       END AS name,
+       CASE WHEN n:Episode THEN 'Episode' ELSE coalesce(n.type, 'Entity') END AS type,
+       CASE
+         WHEN n:Episode THEN n.id
+         ELSE coalesce(n.source_episode_id, mentioned_ep, '')
+       END AS source_episode_id,
+       degree
+ORDER BY name, id
+LIMIT $limit
+"""
+
+COUNT_ORPHANS = """
+MATCH (n)
+WHERE n:Entity OR n:Episode
+OPTIONAL MATCH (n)-[r]-()
+WITH n, count(r) AS degree
+WHERE degree <= $max_degree
+RETURN count(n) AS n
 """
 
 # ---------------------------------------------------------------------------
@@ -612,8 +795,12 @@ MATCH (e)-[r*1..3]-(related)
 UNWIND r AS rel
 RETURN DISTINCT
        e.name AS root_name, e.type AS root_type,
-       startNode(rel).name AS from_name, type(rel) AS rel_type,
-       endNode(rel).name AS to_name,
+       startNode(rel).id AS from_id,
+       coalesce(startNode(rel).name, startNode(rel).key, startNode(rel).id) AS from_name,
+       type(rel) AS rel_type,
+       endNode(rel).id AS to_id,
+       coalesce(endNode(rel).name, endNode(rel).key, endNode(rel).id) AS to_name,
+       endNode(rel).id AS target,
        related.name AS neighbor, related.type AS neighbor_type
 LIMIT $limit
 """
@@ -664,10 +851,6 @@ MATCH (ep:Episode {id: $episode_id})
 SET ep.active = false,
     ep.deleted_at = datetime(),
     ep.updated_at = datetime()
-WITH ep
-OPTIONAL MATCH (f:Fact {source_session_id: ep.source_session_id, source_agent_id: ep.source_agent_id})
-WHERE f.valid_until IS NULL
-SET f.valid_until = datetime(), f.superseded_by = 'forgotten'
 RETURN ep.id AS id
 """
 

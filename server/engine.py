@@ -30,6 +30,7 @@ from .graph.driver import GraphDriver
 from .llm.extract import ExtractionLLM
 from .models import (
     ConflictInfo,
+    EntityOut,
     ExtractionResult,
     RecallHit,
     RememberResponse,
@@ -58,6 +59,7 @@ ACCESS_BOOST_CAP = 2.0
 NEAR_DUP_TOKEN_OVERLAP = 0.97
 
 MAX_PROCESS_ATTEMPTS = 3
+EXTRACT_TIMEOUT_SECONDS = 210
 # resolve() refuses to merge names below this surface similarity unless
 # fuzzy or force is set. Bigram-Jaccard over normalised names: "Slingshot
 # Results Hub" vs "Renaldi Tjahaya" scores ~0.03, real variants score 0.5+.
@@ -430,9 +432,25 @@ class MemoryEngine:
         await self.graph.run(Q.CLEAR_EPISODE_LINKS, episode_id=episode_id)
         await self.graph.run(Q.DELETE_EPISODE_FACTS, episode_id=episode_id)
 
-        extraction = await self.llm.extract(
-            content, agent_id=agent_id, session_id=session_id, tags=tags
-        )
+        index_linked = 0
+        try:
+            extraction = await asyncio.wait_for(
+                self.llm.extract(content, agent_id=agent_id, session_id=session_id, tags=tags),
+                timeout=EXTRACT_TIMEOUT_SECONDS,
+            )
+        except Exception as exc:  # noqa: BLE001
+            # An index card must still attach its topic cards when the model
+            # times out or the process previously died mid-extraction.
+            index_linked = await self._link_index_topic_cards(episode_id)
+            if index_linked <= 0:
+                raise
+            log.error(
+                "Extraction failed for %s; linked %s topic cards: %s",
+                episode_id,
+                index_linked,
+                safe_error(exc, content),
+            )
+            extraction = ExtractionResult()
         entities = self._select_entities(content, extraction)
         name_to_entity_id: dict[str, str] = {}
         linked_ids: set[str] = set()
@@ -454,12 +472,7 @@ class MemoryEngine:
             to_id = name_to_entity_id.get(_norm_name(rel.to_name))
             if not from_id or not to_id or from_id not in linked_ids or to_id not in linked_ids:
                 continue
-            await self.graph.run(
-                Q.CREATE_RELATIONSHIP_STATIC,
-                from_id=from_id,
-                to_id=to_id,
-                type=rel.type,
-            )
+            await self._relate(from_id, to_id, rel.type, episode_id=episode_id)
 
         for fact in extraction.facts:
             subject_id = ""
@@ -491,6 +504,71 @@ class MemoryEngine:
                 await self.graph.run(Q.SET_ENTITY_EMBEDDING, entity_id=ent_id, vector=vec)
             except Exception:  # noqa: BLE001
                 pass
+
+        if index_linked <= 0:
+            await self._link_index_topic_cards(episode_id)
+
+    async def _relate(self, from_id: str, to_id: str, rel_type: str, episode_id: str = "") -> None:
+        """Create an entity edge, or point MENTIONED_IN at the source episode.
+
+        MENTIONED_IN always ends on the episode node. The relationship stores
+        that id in `target` so a later read never sees target = null.
+        """
+        if not from_id or not to_id or from_id == to_id:
+            return
+        if rel_type == "MENTIONED_IN" and episode_id:
+            await self.graph.run(Q.LINK_EPISODE_ENTITY, episode_id=episode_id, entity_id=from_id)
+            await self.graph.run(Q.LINK_EPISODE_ENTITY, episode_id=episode_id, entity_id=to_id)
+            return
+        await self.graph.run(
+            Q.CREATE_RELATIONSHIP_STATIC,
+            from_id=from_id,
+            to_id=to_id,
+            type=rel_type,
+        )
+        if episode_id:
+            await self.graph.run(
+                Q.STAMP_RELATIONSHIP,
+                from_id=from_id,
+                to_id=to_id,
+                rel_type=rel_type,
+                episode_id=episode_id,
+            )
+
+    async def _link_index_topic_cards(self, episode_id: str) -> int:
+        """Attach every topic-card episode to an index episode.
+
+        The index is a catalog. Linking does not depend on the LLM, so a long
+        or timed-out extraction still produces the topic-card edges.
+        """
+        brief = await self.graph.run_one(Q.GET_EPISODE_BRIEF, episode_id=episode_id)
+        if not brief or brief.get("active") is False:
+            return 0
+        key = (brief.get("key") or "").strip().lower()
+        head = (brief.get("content_head") or "").lstrip().lower()
+        if key not in {"index", "index card"} and not key.startswith("index") and not head.startswith("index"):
+            return 0
+        cards = await self.graph.run(Q.TOPIC_CARD_EPISODES)
+        linked = 0
+        seen: set[str] = set()
+        for card in cards:
+            card_id = card.get("id") or ""
+            if not card_id or card_id == episode_id:
+                continue
+            title = _topic_card_title(card) or (card.get("key") or "")
+            title = title.strip()
+            if not title or title.lower() in seen:
+                continue
+            seen.add(title.lower())
+            ent_id, _merged = await self._upsert_entity(
+                EntityOut(name=title, type="Topic", description="", aliases=[])
+            )
+            await self.graph.run(Q.LINK_EPISODE_ENTITY, episode_id=episode_id, entity_id=ent_id)
+            await self.graph.run(Q.LINK_EPISODE_ENTITY, episode_id=card_id, entity_id=ent_id)
+            linked += 1
+        if linked:
+            log.info("Linked %s topic cards to %s", linked, episode_id)
+        return linked
 
     async def _is_overly_common(self, entity_id: str) -> bool:
         row = await self.graph.run_one(Q.ENTITY_LINK_STATS, id=entity_id)
@@ -863,14 +941,20 @@ class MemoryEngine:
         edges = []
         seen = set()
         for r in rows:
-            key = (r.get("from_name"), r.get("rel_type"), r.get("to_name"))
+            from_id = r.get("from_id") or r.get("from_name")
+            to_id = r.get("target") or r.get("to_id") or r.get("to_name")
+            if not from_id or not to_id:
+                continue
+            key = (from_id, r.get("rel_type"), to_id)
             if key in seen:
                 continue
             seen.add(key)
             edges.append({
-                "from": r.get("from_name"),
+                "from": r.get("from_name") or from_id,
+                "to": r.get("to_name") or to_id,
+                "source": from_id,
+                "target": to_id,
                 "type": r.get("rel_type"),
-                "to": r.get("to_name"),
             })
         root = rows[0].get("root_name") if rows else None
         return {"entity": root or entity_name, "edges": edges, "edge_count": len(edges)}
@@ -1358,10 +1442,120 @@ class MemoryEngine:
     # ------------------------------------------------------------------
 
     async def forget(self, memory_id: str) -> dict:
+        exclusive = await self.graph.run(Q.ENTITY_IDS_ONLY_ON_EPISODE, episode_id=memory_id)
+        exclusive_ids = [row["id"] for row in exclusive if row.get("id")]
         row = await self.graph.run_one(Q.SOFT_DELETE_EPISODE, episode_id=memory_id)
         if not row:
             return {"forgotten": False, "error": f"episode {memory_id} not found"}
-        return {"forgotten": True, "episode_id": memory_id}
+        facts = await self.graph.run(Q.INVALIDATE_EPISODE_FACTS, episode_id=memory_id)
+        links = await self.graph.run(Q.CLEAR_EPISODE_LINKS, episode_id=memory_id)
+        provenance = await self.graph.run(Q.DROP_PROVENANCE_EDGES, episode_id=memory_id)
+        stale = await self.graph.run(Q.PURGE_STALE_EDGES)
+        removed_nodes = {"deleted": 0}
+        if exclusive_ids:
+            removed_nodes = await self.graph.run_one(
+                Q.DELETE_ISOLATED_ENTITIES, ids=exclusive_ids
+            ) or {"deleted": 0}
+        return {
+            "forgotten": True,
+            "episode_id": memory_id,
+            "facts_invalidated": int((facts[0].get("invalidated") if facts else 0) or 0),
+            "links_removed": int((links[0].get("deleted") if links else 0) or 0),
+            "edges_removed": int((provenance[0].get("deleted") if provenance else 0) or 0)
+            + int((stale[0].get("deleted") if stale else 0) or 0),
+            "nodes_removed": int(removed_nodes.get("deleted") or 0),
+        }
+
+    async def list_orphans(self, include_single_edge: bool = False, limit: int = 5000) -> dict:
+        """Nodes with no edges, or also nodes with a single edge when asked."""
+        max_degree = 1 if include_single_edge else 0
+        limit = max(1, min(int(limit or 5000), 5000))
+        rows = await self.graph.run(Q.LIST_ORPHANS, max_degree=max_degree, limit=limit)
+        total = await self.graph.run_one(Q.COUNT_ORPHANS, max_degree=max_degree)
+        orphans = [
+            {
+                "id": row.get("id") or "",
+                "name": row.get("name") or "",
+                "type": row.get("type") or "",
+                "source_episode_id": row.get("source_episode_id") or "",
+                "degree": int(row.get("degree") or 0),
+            }
+            for row in rows
+            if row.get("id")
+        ]
+        return {
+            "count": int((total or {}).get("n") or 0),
+            "returned": len(orphans),
+            "max_degree": max_degree,
+            "orphans": orphans,
+        }
+
+    async def backfill_mentioned_in_targets(self) -> dict:
+        """Set MENTIONED_IN.target to the episode id, and relink edges that do not end on an episode."""
+        repaired_rows = await self.graph.run(Q.BACKFILL_MENTIONED_TARGETS)
+        repaired = int((repaired_rows[0].get("repaired") if repaired_rows else 0) or 0)
+        dangling = await self.graph.run(Q.LIST_DANGLING_MENTIONED)
+        by_entity: dict[str, list[dict]] = {}
+        for row in dangling:
+            from_id = row.get("from_id") or ""
+            if from_id:
+                by_entity.setdefault(from_id, []).append(row)
+        relinked = 0
+        deleted = 0
+        for from_id, rows in by_entity.items():
+            episodes = await self.graph.run(Q.LIST_ENTITY_EPISODES, id=from_id)
+            targets = [ep.get("id") for ep in episodes if ep.get("id")]
+            for row in rows:
+                source_episode = row.get("source_episode_id") or ""
+                to_id = row.get("to_id") or ""
+                if source_episode and source_episode not in targets:
+                    targets.append(source_episode)
+                if row.get("to_is_episode") and to_id and to_id not in targets:
+                    targets.append(to_id)
+            await self.graph.run(Q.CLEAR_BROKEN_MENTION, from_id=from_id)
+            deleted += len(rows)
+            seen_targets: set[str] = set()
+            for episode_id in targets:
+                if not episode_id or episode_id in seen_targets:
+                    continue
+                seen_targets.add(episode_id)
+                await self.graph.run(
+                    Q.LINK_EPISODE_ENTITY, episode_id=episode_id, entity_id=from_id
+                )
+                relinked += 1
+        remaining = await self.graph.run_one(Q.COUNT_NULL_MENTION_TARGETS)
+        return {
+            "repaired": repaired,
+            "dangling": len(dangling),
+            "dangling_deleted": deleted,
+            "relinked": relinked,
+            "null_targets": int((remaining or {}).get("n") or 0),
+        }
+
+    async def remove_named_edge(self, left: str, right: str) -> dict:
+        """Delete the edge between two entity names and drop `right` if nothing else remains."""
+        edges = await self.graph.run(Q.DELETE_EDGES_BETWEEN_NAMES, left=left, right=right)
+        inactive = await self.graph.run(Q.DELETE_INACTIVE_MENTIONS_BY_NAME, name=right)
+        node = await self.graph.run(Q.DELETE_ISOLATED_ENTITY_BY_NAME, name=right)
+        return {
+            "edges_removed": int((edges[0].get("deleted") if edges else 0) or 0),
+            "inactive_mentions_removed": int((inactive[0].get("deleted") if inactive else 0) or 0),
+            "nodes_removed": int((node[0].get("deleted") if node else 0) or 0),
+            "name": right,
+        }
+
+    async def resume_pending(self) -> dict:
+        """Re-queue active episodes left pending after a restart or a lost background task.
+
+        Pending work lives only in memory. A crash or a stuck extraction lane
+        leaves status='pending' forever because reprocess_failed() only selects
+        status='failed'. Startup calls this so those episodes run again.
+        """
+        rows = await self.graph.run(Q.LIST_PENDING_IDS, limit=500)
+        ids = [row["id"] for row in rows if row.get("id")]
+        if not ids:
+            return {"queued": [], "reset": [], "missing": [], "skipped": []}
+        return await self.reprocess_failed(ids, wait=False)
 
     # ------------------------------------------------------------------
     # health

@@ -388,6 +388,170 @@ async def test_context_index_and_topic_card_key():
     await engine.close()
 
 
+async def test_mentioned_in_target_backfill_and_orphans():
+    engine, graph, _llm = await make_engine()
+    await graph.run(
+        Q.UPSERT_ENTITY, id="ent_lonely", name="Lonely Node", type="Concept", description="", aliases=[],
+    )
+    await graph.run(
+        Q.UPSERT_ENTITY, id="ent_other", name="Other Node", type="Concept", description="", aliases=[],
+    )
+    await graph.run(
+        Q.CREATE_EPISODE,
+        id="ep_src", content="Project: Lonely Node", summary="lonely", tags=[],
+        source_agent_id="t", source_session_id="", request_id="", content_hash="lonely", key="",
+    )
+    await graph.run(Q.LINK_EPISODE_ENTITY, entity_id="ent_lonely", episode_id="ep_src")
+    graph.mention_target[("ent_lonely", "ep_src")] = None
+    graph.rels.append(("ent_lonely", "MENTIONED_IN", "ent_other"))
+
+    repaired = await engine.backfill_mentioned_in_targets()
+    assert repaired["null_targets"] == 0
+    assert graph.mention_target[("ent_lonely", "ep_src")] == "ep_src"
+    assert ("ent_lonely", "MENTIONED_IN", "ent_other") not in graph.rels
+    direct = await graph.run(Q.COUNT_NULL_MENTION_TARGETS)
+    assert direct[0]["n"] == 0
+
+    orphans = await engine.list_orphans()
+    counted = await graph.run(Q.COUNT_ORPHANS, max_degree=0)
+    assert orphans["count"] == counted[0]["n"]
+    assert orphans["count"] == len(orphans["orphans"])
+    lonely_ids = {row["id"] for row in orphans["orphans"]}
+    assert "ent_other" in lonely_ids
+    assert "ent_lonely" not in lonely_ids
+    row = next(item for item in orphans["orphans"] if item["id"] == "ent_other")
+    assert row["name"] == "Other Node"
+    assert row["type"] == "Concept"
+    assert "source_episode_id" in row
+
+    single = await engine.list_orphans(include_single_edge=True)
+    assert "ent_lonely" in {item["id"] for item in single["orphans"]}
+    await engine.close()
+
+
+async def test_forget_removes_edges_and_nodes_from_that_episode_only():
+    engine, graph, _llm = await make_engine()
+    await graph.run(
+        Q.UPSERT_ENTITY, id="ent_m", name="Mnemosyne", type="Project", description="", aliases=[],
+    )
+    await graph.run(
+        Q.UPSERT_ENTITY, id="ent_v", name="Vela Tavern v3", type="Project", description="", aliases=[],
+    )
+    for ep_id, content, active_after in (
+        ("ep_vela", "Vela Tavern v3 notes", False),
+        ("ep_keep", "Mnemosyne stays", True),
+    ):
+        await graph.run(
+            Q.CREATE_EPISODE,
+            id=ep_id, content=content, summary=content, tags=[], source_agent_id="t",
+            source_session_id="", request_id="", content_hash=ep_id, key="",
+        )
+    await graph.run(Q.LINK_EPISODE_ENTITY, entity_id="ent_v", episode_id="ep_vela")
+    await graph.run(Q.LINK_EPISODE_ENTITY, entity_id="ent_m", episode_id="ep_vela")
+    await graph.run(Q.LINK_EPISODE_ENTITY, entity_id="ent_m", episode_id="ep_keep")
+    await graph.run(Q.CREATE_RELATIONSHIP_STATIC, from_id="ent_m", to_id="ent_v", type="RELATED_TO")
+    await graph.run(
+        Q.CREATE_FACT,
+        id="fact_v", content="vela fact", subject="ent_v", confidence=0.9,
+        source_agent_id="t", source_session_id="", episode_id="ep_vela",
+    )
+    await graph.run(
+        Q.CREATE_FACT,
+        id="fact_keep", content="keep fact", subject="ent_m", confidence=0.9,
+        source_agent_id="t", source_session_id="", episode_id="ep_keep",
+    )
+
+    forgotten = await engine.forget("ep_vela")
+    assert forgotten["forgotten"] is True
+    assert graph.episodes["ep_vela"]["active"] is False
+    assert graph.episodes["ep_keep"]["active"] is True
+    assert "ep_keep" in graph.episodes
+    assert ("ent_m", "RELATED_TO", "ent_v") not in graph.rels
+    assert "ent_v" not in graph.entities
+    assert "ent_m" in graph.entities
+    assert graph.facts["fact_v"]["valid_until"]
+    assert graph.facts["fact_keep"]["valid_until"] is None
+    assert ("ent_m", "ep_vela") not in graph.mentions
+    assert ("ent_m", "ep_keep") in graph.mentions
+    await engine.close()
+
+
+async def test_remove_named_vela_edge_when_only_inactive_sources_remain():
+    engine, graph, _llm = await make_engine()
+    await graph.run(
+        Q.UPSERT_ENTITY, id="ent_m", name="Mnemosyne", type="Project", description="", aliases=[],
+    )
+    await graph.run(
+        Q.UPSERT_ENTITY, id="ent_v", name="Vela Tavern v3", type="Project", description="", aliases=[],
+    )
+    await graph.run(
+        Q.CREATE_EPISODE,
+        id="ep_old", content="old vela", summary="old", tags=[], source_agent_id="t",
+        source_session_id="", request_id="", content_hash="old", key="",
+    )
+    graph.episodes["ep_old"]["active"] = False
+    await graph.run(Q.LINK_EPISODE_ENTITY, entity_id="ent_v", episode_id="ep_old")
+    await graph.run(Q.CREATE_RELATIONSHIP_STATIC, from_id="ent_m", to_id="ent_v", type="RELATED_TO")
+    removed = await engine.remove_named_edge("Mnemosyne", "Vela Tavern v3")
+    assert removed["edges_removed"] == 1
+    assert removed["nodes_removed"] == 1
+    assert "ent_v" not in graph.entities
+    assert "ent_m" in graph.entities
+    assert ("ent_m", "RELATED_TO", "ent_v") not in graph.rels
+    await engine.close()
+
+
+async def test_index_episode_links_topic_cards_with_targets():
+    engine, graph, _llm = await make_engine()
+    for key in ("topic-card:alpha", "topic-card:beta"):
+        await graph.run(
+            Q.CREATE_EPISODE,
+            id=f"ep_{key.split(':')[1]}",
+            content=f"TOPIC CARD: {key.split(':')[1]}",
+            summary=key,
+            tags=[],
+            source_agent_id="t",
+            source_session_id="",
+            request_id="",
+            content_hash=key,
+            key=key,
+        )
+    saved = await engine.remember("INDEX\ncatalog of topic cards", agent_id="host", key="index card")
+    await settle(engine)
+    status = await engine.episode_status(saved.episode_id)
+    assert status["status"] == "processed"
+    index_links = [pair for pair in graph.mentions if pair[1] == saved.episode_id]
+    assert len(index_links) == 2
+    assert {graph.mention_target[pair] for pair in index_links} == {saved.episode_id}
+    names = {ent["name"] for ent in graph.entities.values()}
+    assert "TOPIC CARD: alpha" in names
+    assert "TOPIC CARD: beta" in names
+    await engine.close()
+
+
+async def test_resume_pending_reprocesses_abandoned_episode():
+    engine, graph, _llm = await make_engine()
+    await graph.run(
+        Q.CREATE_EPISODE,
+        id="ep_3093510dda5c45c1",
+        content="INDEX\nstuck index card",
+        summary="index card",
+        tags=[],
+        source_agent_id="t",
+        source_session_id="",
+        request_id="",
+        content_hash="stuck-index",
+        key="index card",
+    )
+    resumed = await engine.resume_pending()
+    assert "ep_3093510dda5c45c1" in resumed["queued"]
+    await settle(engine)
+    status = await engine.episode_status("ep_3093510dda5c45c1")
+    assert status["status"] == "processed"
+    assert status["attempts"] >= 1
+    await engine.close()
+
+
 async def test_secrets_are_rejected_and_normal_text_saves():
     engine, graph, _llm = await make_engine()
     rejected = await engine.remember("password: hunter2-example", agent_id="host")
