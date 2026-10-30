@@ -634,6 +634,24 @@ FOREACH (rel IN rels | DELETE rel)
 RETURN size(rels) AS deleted
 """
 
+COUNT_ACTIVE_MENTIONS_BY_NAME = """
+MATCH (e:Entity)-[:MENTIONED_IN]->(ep:Episode)
+WHERE toLower(e.name) = toLower($name) AND coalesce(ep.active, true) = true
+RETURN count(*) AS n
+"""
+
+# An entity whose only backing episodes were forgotten still keeps its
+# derived entity-entity edges (USES, WORKING_ON, ...). Those edges came from
+# deleted episodes too, so drop them to let the node itself be collected.
+DROP_ALL_EDGES_BY_NAME = """
+MATCH (e:Entity)
+WHERE toLower(e.name) = toLower($name)
+OPTIONAL MATCH (e)-[r]-()
+WITH e, collect(r) AS rels
+FOREACH (rel IN rels | DELETE rel)
+RETURN size(rels) AS deleted
+"""
+
 DELETE_ISOLATED_ENTITY_BY_NAME = """
 MATCH (e:Entity)
 WHERE toLower(e.name) = toLower($name) AND NOT (e)--()

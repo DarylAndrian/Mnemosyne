@@ -1533,13 +1533,26 @@ class MemoryEngine:
         }
 
     async def remove_named_edge(self, left: str, right: str) -> dict:
-        """Delete the edge between two entity names and drop `right` if nothing else remains."""
+        """Delete the edge between two entity names and drop `right` if nothing else remains.
+
+        If the target keeps derived entity-entity edges but has no LIVE episode
+        backing any more, those edges are themselves leftovers of forgotten
+        episodes, so they are dropped and the node is collected too.
+        """
         edges = await self.graph.run(Q.DELETE_EDGES_BETWEEN_NAMES, left=left, right=right)
         inactive = await self.graph.run(Q.DELETE_INACTIVE_MENTIONS_BY_NAME, name=right)
         node = await self.graph.run(Q.DELETE_ISOLATED_ENTITY_BY_NAME, name=right)
+        derived_edges = 0
+        if not int((node[0].get("deleted") if node else 0) or 0):
+            live = await self.graph.run_one(Q.COUNT_ACTIVE_MENTIONS_BY_NAME, name=right)
+            if not int((live or {}).get("n") or 0):
+                dropped = await self.graph.run(Q.DROP_ALL_EDGES_BY_NAME, name=right)
+                derived_edges = int((dropped[0].get("deleted") if dropped else 0) or 0)
+                node = await self.graph.run(Q.DELETE_ISOLATED_ENTITY_BY_NAME, name=right)
         return {
             "edges_removed": int((edges[0].get("deleted") if edges else 0) or 0),
             "inactive_mentions_removed": int((inactive[0].get("deleted") if inactive else 0) or 0),
+            "derived_edges_removed": derived_edges,
             "nodes_removed": int((node[0].get("deleted") if node else 0) or 0),
             "name": right,
         }
