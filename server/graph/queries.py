@@ -668,14 +668,30 @@ FOREACH (n IN nodes | DETACH DELETE n)
 RETURN size(nodes) AS deleted
 """
 
+# Entities the index already owns (source_episode_id) but lost their edge
+# when CLEAR_EPISODE_LINKS ran and the LLM did not re-mine them.
+LIST_UNLINKED_OWNED_ENTITIES = """
+MATCH (e:Entity)
+WHERE coalesce(e.source_episode_id, '') = $episode_id
+  AND NOT (e)-[:MENTIONED_IN]->(:Episode {id: $episode_id})
+RETURN e.id AS id, coalesce(e.name, '') AS name
+"""
+
 LIST_ORPHANS = """
 MATCH (n)
 WHERE n:Entity OR n:Episode
-OPTIONAL MATCH (n)-[r]-()
-WITH n, count(r) AS degree
-WHERE degree <= $max_degree
 OPTIONAL MATCH (n)-[:MENTIONED_IN]->(ep:Episode)
-WITH n, degree, head(collect(DISTINCT ep.id)) AS mentioned_ep
+WITH n,
+     count(ep) AS mentions,
+     sum(CASE WHEN coalesce(ep.active, true) = true THEN 1 ELSE 0 END) AS live_mentions
+WHERE $include_inactive = true
+   OR (n:Episode AND coalesce(n.active, true) = true)
+   OR (n:Entity AND (mentions = 0 OR live_mentions > 0))
+OPTIONAL MATCH (n)-[r]-()
+WITH n, mentions, live_mentions, count(r) AS degree
+WHERE degree <= $max_degree
+OPTIONAL MATCH (n)-[:MENTIONED_IN]->(mep:Episode)
+WITH n, degree, mentions, live_mentions, head(collect(DISTINCT mep.id)) AS mentioned_ep
 RETURN n.id AS id,
        CASE
          WHEN n:Episode THEN coalesce(n.key, substring(coalesce(n.summary, n.content, n.id), 0, 80))
@@ -691,9 +707,20 @@ ORDER BY name, id
 LIMIT $limit
 """
 
+# Mirrors LIST_ORPHANS (eligibility + degree) exactly so the list count and
+# the count query always agree: forgotten episodes are hidden, and so are
+# entities whose every mention points at a forgotten episode. Entities with
+# no episode at all stay visible - they are genuine orphans.
 COUNT_ORPHANS = """
 MATCH (n)
 WHERE n:Entity OR n:Episode
+OPTIONAL MATCH (n)-[:MENTIONED_IN]->(ep:Episode)
+WITH n,
+     count(ep) AS mentions,
+     sum(CASE WHEN coalesce(ep.active, true) = true THEN 1 ELSE 0 END) AS live_mentions
+WHERE $include_inactive = true
+   OR (n:Episode AND coalesce(n.active, true) = true)
+   OR (n:Entity AND (mentions = 0 OR live_mentions > 0))
 OPTIONAL MATCH (n)-[r]-()
 WITH n, count(r) AS degree
 WHERE degree <= $max_degree

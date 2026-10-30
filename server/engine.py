@@ -566,6 +566,16 @@ class MemoryEngine:
             await self.graph.run(Q.LINK_EPISODE_ENTITY, episode_id=episode_id, entity_id=ent_id)
             await self.graph.run(Q.LINK_EPISODE_ENTITY, episode_id=card_id, entity_id=ent_id)
             linked += 1
+        # Re-attach entities this index already owns but lost: CLEAR_EPISODE_LINKS
+        # wipes every mention on reprocess, and the rebuild only recreates what
+        # the LLM re-mines, so cards that were linked before went degree-0 while
+        # keeping source_episode_id (they surfaced as orphans).
+        for owned in await self.graph.run(Q.LIST_UNLINKED_OWNED_ENTITIES, episode_id=episode_id):
+            owned_id = owned.get("id")
+            if not owned_id:
+                continue
+            await self.graph.run(Q.LINK_EPISODE_ENTITY, episode_id=episode_id, entity_id=owned_id)
+            linked += 1
         if linked:
             log.info("Linked %s topic cards to %s", linked, episode_id)
         return linked
@@ -1466,12 +1476,30 @@ class MemoryEngine:
             "nodes_removed": int(removed_nodes.get("deleted") or 0),
         }
 
-    async def list_orphans(self, include_single_edge: bool = False, limit: int = 5000) -> dict:
-        """Nodes with no edges, or also nodes with a single edge when asked."""
+    async def list_orphans(
+        self,
+        include_single_edge: bool = False,
+        limit: int = 5000,
+        include_inactive: bool = False,
+    ) -> dict:
+        """Nodes with no edges, or also nodes with a single edge when asked.
+
+        By default forgotten (active=false) episodes are hidden, along with
+        entities whose every mention points at a forgotten episode. Pass
+        include_inactive=True to see them. Entities with no episode at all
+        are always shown - they are genuine orphans.
+        """
         max_degree = 1 if include_single_edge else 0
         limit = max(1, min(int(limit or 5000), 5000))
-        rows = await self.graph.run(Q.LIST_ORPHANS, max_degree=max_degree, limit=limit)
-        total = await self.graph.run_one(Q.COUNT_ORPHANS, max_degree=max_degree)
+        rows = await self.graph.run(
+            Q.LIST_ORPHANS,
+            max_degree=max_degree,
+            limit=limit,
+            include_inactive=bool(include_inactive),
+        )
+        total = await self.graph.run_one(
+            Q.COUNT_ORPHANS, max_degree=max_degree, include_inactive=bool(include_inactive)
+        )
         orphans = [
             {
                 "id": row.get("id") or "",
@@ -1487,6 +1515,7 @@ class MemoryEngine:
             "count": int((total or {}).get("n") or 0),
             "returned": len(orphans),
             "max_degree": max_degree,
+            "include_inactive": bool(include_inactive),
             "orphans": orphans,
         }
 

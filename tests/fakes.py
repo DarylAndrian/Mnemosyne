@@ -577,22 +577,33 @@ class FakeGraph:
             if ent_id == entity_id and self.episodes.get(ep_id, {}).get("active", True)
         }
 
-    def _orphan_rows(self, max_degree: int) -> list[dict]:
+    def _orphan_rows(self, max_degree: int, include_inactive: bool = False) -> list[dict]:
         rows = []
         nodes: list[tuple[str, str]] = [("entity", ent_id) for ent_id in self.entities]
         nodes += [("episode", ep_id) for ep_id in self.episodes]
         for kind, node_id in nodes:
+            if kind == "episode" and not include_inactive:
+                if self.episodes[node_id].get("active") is False:
+                    continue
+            if kind == "entity" and not include_inactive:
+                # Hide entities whose every mention points at a forgotten
+                # episode; keep entities with no episode at all.
+                mentioned = [ep_id for ent_id, ep_id in self.mentions if ent_id == node_id]
+                if mentioned and not any(
+                    self.episodes.get(e, {}).get("active") is not False for e in mentioned
+                ):
+                    continue
             degree = self._degree(node_id)
             if degree > max_degree:
                 continue
             if kind == "entity":
                 ent = self.entities[node_id]
-                mentioned = next((ep_id for ent_id, ep_id in self.mentions if ent_id == node_id), "")
+                mentioned_eps = [ep_id for ent_id, ep_id in self.mentions if ent_id == node_id]
                 rows.append({
                     "id": node_id,
                     "name": ent.get("name") or node_id,
                     "type": ent.get("type") or "Entity",
-                    "source_episode_id": ent.get("source_episode_id") or mentioned or "",
+                    "source_episode_id": ent.get("source_episode_id") or (mentioned_eps[0] if mentioned_eps else ""),
                     "degree": degree,
                 })
             else:
@@ -791,10 +802,26 @@ class FakeGraph:
             n += sum(1 for rel in self.rels if rel[1] == "MENTIONED_IN" and not self.rel_target.get(rel))
             return [{"n": n}]
         if query == Q.LIST_ORPHANS:
-            rows = self._orphan_rows(int(params.get("max_degree") or 0))
+            rows = self._orphan_rows(
+                int(params.get("max_degree") or 0),
+                bool(params.get("include_inactive", False)),
+            )
             return rows[: params.get("limit") or 5000]
         if query == Q.COUNT_ORPHANS:
-            return [{"n": len(self._orphan_rows(int(params.get("max_degree") or 0)))}]
+            return [{
+                "n": len(self._orphan_rows(
+                    int(params.get("max_degree") or 0),
+                    bool(params.get("include_inactive", False)),
+                ))
+            }]
+        if query == Q.LIST_UNLINKED_OWNED_ENTITIES:
+            episode_id = params.get("episode_id") or ""
+            return [
+                {"id": ent_id, "name": (self.entities[ent_id].get("name") or "")}
+                for ent_id in self.entities
+                if (self.entities[ent_id].get("source_episode_id") or "") == episode_id
+                and (ent_id, episode_id) not in self.mentions
+            ]
         return None
 
 

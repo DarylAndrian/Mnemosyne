@@ -291,17 +291,28 @@ async def list_episodes(
 
 
 @mcp.tool()
-async def list_orphans(include_single_edge: bool = False, limit: int = 5000) -> dict:
+async def list_orphans(
+    include_single_edge: bool = False,
+    limit: int = 5000,
+    include_inactive: bool = False,
+) -> dict:
     """List graph nodes that have no edges.
 
     Args:
         include_single_edge: When true, also include nodes with exactly one edge.
         limit: Max rows to return (the count field is the full total).
+        include_inactive: When true, also include forgotten (active=false)
+            episodes and entities backed only by them. Default false, so
+            soft-deleted material does not show as orphans.
 
     Returns:
         count plus id, name, type, source_episode_id, and degree for each node.
     """
-    return await engine.list_orphans(include_single_edge=include_single_edge, limit=limit)
+    return await engine.list_orphans(
+        include_single_edge=include_single_edge,
+        limit=limit,
+        include_inactive=include_inactive,
+    )
 
 
 @mcp.tool()
@@ -381,6 +392,7 @@ async def _mount_api(app):
         limit = max(10, min(limit, 2000))
         q_type = request.query_params.get("type", "").strip()
         include_episodes = request.query_params.get("include_episodes", "false").lower() in ("1", "true", "yes")
+        include_inactive = request.query_params.get("include_inactive", "false").lower() in ("1", "true", "yes")
 
         nodes: list[dict] = []
         edges: list[dict] = []
@@ -388,19 +400,33 @@ async def _mount_api(app):
         if not await engine.graph.ping():
             return _cors(JSONResponse({"nodes": [], "edges": [], "error": "neo4j unreachable"}, status_code=503))
 
+        # Skip entities that are only backed by forgotten (active=false)
+        # episodes: soft-deleted material should not appear in the graph.
+        # Entities with no episode at all are kept - they are real orphans.
+        entity_visibility = (
+            "$include_inactive = true "
+            "OR NOT (e)-[:MENTIONED_IN]->(:Episode) "
+            "OR EXISTS { MATCH (e)-[:MENTIONED_IN]->(ep:Episode) "
+            "            WHERE coalesce(ep.active, true) = true }"
+        )
+
         # Entities
         try:
             if q_type:
                 rows = await engine.graph.run(
-                    "MATCH (e:Entity {type: $t}) RETURN e.id AS id, e.name AS name, e.type AS type, "
+                    "MATCH (e:Entity {type: $t}) "
+                    f"WHERE {entity_visibility} "
+                    "RETURN e.id AS id, e.name AS name, e.type AS type, "
                     "e.description AS description, e.aliases AS aliases, coalesce(e.access_count,0) AS ac LIMIT $limit",
-                    t=q_type, limit=limit,
+                    t=q_type, limit=limit, include_inactive=include_inactive,
                 )
             else:
                 rows = await engine.graph.run(
-                    "MATCH (e:Entity) RETURN e.id AS id, e.name AS name, e.type AS type, "
+                    "MATCH (e:Entity) "
+                    f"WHERE {entity_visibility} "
+                    "RETURN e.id AS id, e.name AS name, e.type AS type, "
                     "e.description AS description, e.aliases AS aliases, coalesce(e.access_count,0) AS ac LIMIT $limit",
-                    limit=limit,
+                    limit=limit, include_inactive=include_inactive,
                 )
         except Exception as exc:
             return _cors(JSONResponse({"nodes": [], "edges": [], "error": str(exc)}, status_code=500))
@@ -480,9 +506,10 @@ async def _mount_api(app):
         if include_episodes:
             try:
                 ep_rows = await engine.graph.run(
-                    "MATCH (ep:Episode) WHERE coalesce(ep.active, true) = true "
+                    "MATCH (ep:Episode) WHERE $include_inactive = true OR coalesce(ep.active, true) = true "
                     "RETURN ep.id AS id, ep.summary AS summary, ep.content AS content, ep.tags AS tags "
                     "ORDER BY ep.created_at DESC LIMIT $limit",
+                    include_inactive=include_inactive,
                     limit=min(limit, 100),
                 )
                 ep_ids = []
@@ -594,13 +621,16 @@ async def _mount_api(app):
 
     async def api_orphans(request: Request):
         include_single = request.query_params.get("include_single_edge", "false").lower() in ("1", "true", "yes")
+        include_inactive = request.query_params.get("include_inactive", "false").lower() in ("1", "true", "yes")
         try:
             limit = int(request.query_params.get("limit", "5000"))
         except ValueError:
             limit = 5000
         if not await engine.graph.ping():
             return _cors(JSONResponse({"orphans": [], "count": 0, "error": "neo4j unreachable"}, status_code=503))
-        data = await engine.list_orphans(include_single_edge=include_single, limit=limit)
+        data = await engine.list_orphans(
+            include_single_edge=include_single, limit=limit, include_inactive=include_inactive
+        )
         return _cors(JSONResponse(data))
 
     async def api_episodes(request: Request):

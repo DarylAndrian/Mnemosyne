@@ -338,3 +338,109 @@ async def test_resolve_then_unresolve_roundtrip():
     finally:
         await _cleanup(graph, [a_id, b_id, c_id, ep_id])
         await engine.close()
+
+
+# ---------------------------------------------------------------------------
+# 5. orphan visibility: forgotten episodes and their-only-backed entities
+# ---------------------------------------------------------------------------
+
+
+async def test_list_orphans_hides_inactive_by_default():
+    """active=false episodes, and entities backed only by them, are hidden."""
+    engine, graph = _mk_engine()
+    live_ep = await _seed_episode(graph)
+    dead_ep = f"ep_dead_{uuid.uuid4().hex[:12]}"
+    live_ent = f"ent_live_{uuid.uuid4().hex[:12]}"
+    dead_ent = f"ent_dead_{uuid.uuid4().hex[:12]}"
+
+    await graph.run(
+        Q.CREATE_EPISODE, id=dead_ep, content="forgotten", summary="", tags=[],
+        source_agent_id="integration-test", source_session_id="",
+        request_id=f"t-{dead_ep}", content_hash=f"h-{dead_ep}", key="",
+    )
+    await graph.run(
+        "MATCH (e:Episode {id:$id}) SET e.active=false", id=dead_ep
+    )
+    for eid, name in ((live_ent, f"Live {live_ent[-6:]}"), (dead_ent, f"Dead {dead_ent[-6:]}")):
+        await graph.run(
+            "CREATE (e:Entity {id:$i, name:$n, type:'Concept', aliases:[], description:'',"
+            " created_at:datetime(), updated_at:datetime()})", i=eid, n=name
+        )
+    await graph.run(Q.LINK_EPISODE_ENTITY, episode_id=live_ep, entity_id=live_ent)
+    await graph.run(Q.LINK_EPISODE_ENTITY, episode_id=dead_ep, entity_id=dead_ent)
+
+    try:
+        shown = await engine.list_orphans()
+        shown_ids = {o["id"] for o in shown["orphans"]}
+        assert live_ep not in shown_ids, "live episode should not be an orphan"
+        assert live_ent not in shown_ids, "linked live entity should not be an orphan"
+        assert dead_ep not in shown_ids, "forgotten episode must be hidden by default"
+        assert dead_ent not in shown_ids, "entity backed only by a forgotten episode must be hidden"
+
+        # single-edge view: the dead entity would qualify on degree, but is still hidden
+        one = await engine.list_orphans(include_single_edge=True)
+        one_ids = {o["id"] for o in one["orphans"]}
+        assert dead_ent not in one_ids, "must stay hidden when include_inactive is false"
+
+        # ...and becomes visible when explicitly asked for
+        all_rows = await engine.list_orphans(include_single_edge=True, include_inactive=True)
+        all_ids = {o["id"] for o in all_rows["orphans"]}
+        assert dead_ep in all_ids, "forgotten episode must appear with include_inactive"
+        assert all_rows["include_inactive"] is True
+
+        # list count and count query must always agree
+        counted = await graph.run_one(Q.COUNT_ORPHANS, max_degree=1, include_inactive=True)
+        assert int(counted["n"]) == len(all_rows["orphans"]), (counted, all_rows["count"])
+    finally:
+        await _cleanup(graph, [live_ep, dead_ep, live_ent, dead_ent])
+        await engine.close()
+
+
+# ---------------------------------------------------------------------------
+# 6. index re-links entities it owns after CLEAR_EPISODE_LINKS wiped them
+# ---------------------------------------------------------------------------
+
+
+async def test_index_relinks_owned_entities():
+    engine, graph = _mk_engine()
+    index_id = await _seed_episode(graph)
+    await graph.run(
+        "MATCH (e:Episode {id:$id}) SET e.key='index', e.request_id='index'",
+        id=index_id,
+    )
+    card_ep = await _seed_episode(graph)
+    await graph.run(
+        "MATCH (e:Episode {id:$id}) SET e.content='Topic Card: '+e.summary, e.key='topic-card:test'",
+        id=card_ep,
+    )
+    owned = f"ent_owned_{uuid.uuid4().hex[:12]}"
+    await graph.run(
+        "CREATE (e:Entity {id:$i, name:$n, type:'Topic', aliases:[], description:'',"
+        " source_episode_id:$src, created_at:datetime(), updated_at:datetime()})",
+        i=owned, n=f"Owned Card {owned[-6:]}", src=index_id,
+    )
+    try:
+        before = await graph.run_one(
+            "MATCH (e:Entity {id:$i})-[r:MENTIONED_IN]->() RETURN count(r) AS n", i=owned
+        )
+        assert int(before["n"]) == 0, "fixture must start unlinked"
+
+        linked = await engine._link_index_topic_cards(index_id)
+        assert linked >= 1, "index must report the re-linked card"
+
+        after = await graph.run_one(
+            "MATCH (e:Entity {id:$i})-[r:MENTIONED_IN]->(ep:Episode) "
+            "WHERE ep.id = $src RETURN count(r) AS n",
+            i=owned, src=index_id,
+        )
+        assert int(after["n"]) == 1, "owned entity must be re-attached to the index"
+
+        # running it again must not duplicate (MERGE)
+        await engine._link_index_topic_cards(index_id)
+        again = await graph.run_one(
+            "MATCH (e:Entity {id:$i})-[r:MENTIONED_IN]->() RETURN count(r) AS n", i=owned
+        )
+        assert int(again["n"]) == 1, "re-running must stay idempotent"
+    finally:
+        await _cleanup(graph, [index_id, card_ep, owned])
+        await engine.close()
