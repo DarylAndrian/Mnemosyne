@@ -1,0 +1,50 @@
+#!/bin/sh
+# Mnemosyne pre-commit guard: refuse to stage secrets.
+#
+# Why: agent-tokens.json was committed in 3efd3db while the repo was public,
+# exposing live Bearer tokens from 2026-08-21 until 2026-11-23. This hook
+# stops the same class of mistake at the door, with no external dependency
+# (gitleaks is optional hardening, this always works).
+#
+# Bypass for a deliberate, reviewed change:  git commit --no-verify
+
+set -eu
+
+fail=0
+
+# 1. files that must never be staged by name
+BAD_PATHS='(^|/)(\.env|agent-tokens\.json|\.ai-pat-.*|.*-pat\.txt|.*token.*\.txt)$'
+
+# 2. inline token shapes that must never appear in staged content
+#    daryl_mem_/mnem_/cd_pat_ prefixes, or MCP_API_KEY=<non-placeholder>
+BAD_CONTENT='daryl_mem_[A-Za-z0-9_-]{8,}|mnem_[A-Za-z0-9_-]{8,}|cd_pat_[A-Za-z0-9_-]{8,}|MCP_API_KEY=[A-Za-z0-9_-]{16,}'
+
+staged=$(git diff --cached --name-only --diff-filter=ACM || true)
+[ -z "$staged" ] && exit 0
+
+for f in $staged; do
+  if printf '%s\n' "$f" | grep -Eq "$BAD_PATHS"; then
+    echo "PRE-COMMIT BLOCKED: '$f' looks like a secret file." >&2
+    echo "  Secrets stay local. agent-tokens.json and .env are gitignored - never add them." >&2
+    fail=1
+    continue
+  fi
+  # only scan text-ish files that are actually staged
+  case "$f" in
+    *.png|*.jpg|*.jpeg|*.gif|*.webp|*.pdf|*.zip|*.db|*.sqlite) continue ;;
+  esac
+  if git show ":$f" 2>/dev/null | grep -Eq "$BAD_CONTENT"; then
+    echo "PRE-COMMIT BLOCKED: '$f' contains what looks like a live token." >&2
+    echo "  Use agent-tokens.example.json (placeholder) instead of a real value." >&2
+    fail=1
+  fi
+done
+
+if [ "$fail" -ne 0 ]; then
+  echo "" >&2
+  echo "Nothing was committed. If this is a false positive and you have" >&2
+  echo "reviewed the diff, re-run with:  git commit --no-verify" >&2
+  exit 1
+fi
+
+exit 0

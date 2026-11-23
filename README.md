@@ -86,6 +86,26 @@ python server/agent_tokens.py create <name> [display_name]   # agent_id becomes 
 python server/agent_tokens.py revoke <token>
 ```
 
+- The token path defaults to `<repo root>/agent-tokens.json` and can be moved
+  with `AGENT_TOKENS_FILE=/some/where/agent-tokens.json`.
+  **Set it wherever you launch the server** (pm2 env or your shell). The CLI
+  does not read `.env`, so if you set it only there the CLI would edit a
+  different file than the server uses - set it in one place, the launcher's
+  environment.
+
+### Pre-commit secret guard (enable after cloning)
+
+The repo ships a hook at `.githooks/pre-commit` that refuses to stage
+`agent-tokens.json`, `.env`, and anything containing a live-looking token.
+Git does not run hooks from a cloned repo automatically - turn it on once:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+It never blocks a normal change. If you ever need to bypass a false
+positive after reviewing the diff: `git commit --no-verify`.
+
 History note: this file was committed in `3efd3db` (2026-08-21) and stayed
 public until 2026-11-23. Both tokens it exposed were rotated that day and
 now return 401. The old copies remain in git history; until history is

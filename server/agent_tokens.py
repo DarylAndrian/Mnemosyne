@@ -11,7 +11,8 @@ import os
 import secrets
 from pathlib import Path
 
-TOKENS_FILE = Path(__file__).resolve().parent.parent / "agent-tokens.json"
+_default_tokens = Path(__file__).resolve().parent.parent / "agent-tokens.json"
+TOKENS_FILE = Path(os.environ["AGENT_TOKENS_FILE"]) if os.environ.get("AGENT_TOKENS_FILE") else _default_tokens
 
 
 def load_tokens() -> dict:
