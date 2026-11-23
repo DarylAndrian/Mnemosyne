@@ -8,8 +8,20 @@ from __future__ import annotations
 
 import json
 import os
-import secrets
+import sys
 from pathlib import Path
+
+# server/secrets.py is the app's "reject likely secrets" helper. When this
+# file is run AS A SCRIPT (python server/agent_tokens.py) the script's own
+# directory lands on sys.path[0], so `import secrets` picks that file instead
+# of the stdlib and create_agent() dies with
+#     AttributeError: module 'secrets' has no attribute 'token_urlsafe'
+# Drop this directory from the path before importing so we always get the
+# real stdlib module. Nothing else here needs it on the path.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path[:] = [p for p in sys.path if os.path.abspath(p or os.getcwd()) != _HERE]
+
+import secrets
 
 _default_tokens = Path(__file__).resolve().parent.parent / "agent-tokens.json"
 TOKENS_FILE = Path(os.environ["AGENT_TOKENS_FILE"]) if os.environ.get("AGENT_TOKENS_FILE") else _default_tokens
@@ -30,11 +42,17 @@ def save_tokens(tokens: dict) -> None:
     )
 
 
-def create_agent(name: str, display_name: str = "") -> dict:
-    """Create a new agent with a unique token. Returns the agent info."""
+def create_agent(name: str, display_name: str = "", bare: bool = False) -> dict:
+    """Create a new agent with a unique token. Returns the agent info.
+
+    bare=True keeps the id exactly as given (e.g. "claude") instead of
+    namespacing it under hermes- (e.g. "hermes-claude"). Nothing filters on
+    the prefix - it is purely a naming convention - so use bare for agents
+    that are not Hermes clients.
+    """
     tokens = load_tokens()
     token = f"mnem_{secrets.token_urlsafe(32)}"
-    agent_id = f"hermes-{name}"
+    agent_id = name if bare else f"hermes-{name}"
     tokens[token] = {
         "agent_id": agent_id,
         "display_name": display_name or name,
@@ -80,16 +98,22 @@ if __name__ == "__main__":
 
     if len(sys.argv) < 2:
         print("Usage:")
-        print("  python agent_tokens.py create <name> [display_name]")
+        print("  python agent_tokens.py create [--bare] <name> [display_name]")
+        print("      --bare  keep the agent_id exactly as <name> (default: hermes-<name>)")
         print("  python agent_tokens.py list")
         print("  python agent_tokens.py revoke <token>")
         sys.exit(1)
 
     cmd = sys.argv[1]
     if cmd == "create":
-        name = sys.argv[2] if len(sys.argv) > 2 else "agent"
-        display = sys.argv[3] if len(sys.argv) > 3 else ""
-        info = create_agent(name, display)
+        args = sys.argv[2:]
+        bare = False
+        if args and args[0] == "--bare":
+            bare = True
+            args = args[1:]
+        name = args[0] if args else "agent"
+        display = args[1] if len(args) > 1 else ""
+        info = create_agent(name, display, bare=bare)
         print(f"Agent created:")
         print(f"  agent_id:      {info['agent_id']}")
         print(f"  display_name:  {info['display_name']}")
