@@ -1,4 +1,6 @@
 .env
+# agent tokens: NEVER commit (leaked publicly 2026-08-21..2026-11-23)
+agent-tokens.json
 .venv/
 __pycache__/
 *.pyc

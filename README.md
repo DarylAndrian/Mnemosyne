@@ -70,6 +70,27 @@ No build step and no internet needed -- plain HTML/JS with vis-network vendored 
 | `MCP_PORT` | `8080` | Listen port |
 | `MCP_API_KEY` | (required) | Shared API key for auth |
 
+## Agent tokens (local only - never committed)
+
+Per-agent Bearer tokens live in `agent-tokens.json` at the repo root. That
+file is **gitignored and untracked** - it is local to this host only.
+
+- Do not `git add` it. Do not copy token values into commits, PRs, issues,
+  chat or logs.
+- `agent-tokens.example.json` is the committed template (fake entry only).
+- Manage tokens with:
+
+```bash
+python server/agent_tokens.py list
+python server/agent_tokens.py create <name> [display_name]   # agent_id becomes hermes-<name>
+python server/agent_tokens.py revoke <token>
+```
+
+History note: this file was committed in `3efd3db` (2026-08-21) and stayed
+public until 2026-11-23. Both tokens it exposed were rotated that day and
+now return 401. The old copies remain in git history; until history is
+scrubbed or the repo is made private, treat any token found there as dead.
+
 ## MCP Tools
 
 ### `remember(content, agent_id, session_id?, tags?, request_id?)`
