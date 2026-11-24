@@ -108,6 +108,11 @@ class ExtractionLLM:
                 "model": self._model,
                 "prompt": prompt,
                 "stream": False,
+                # Reasoning models (Gemma 4, Qwen3, ...) burn their whole
+                # output budget thinking before answering; with format="json"
+                # that ran 144s per episode instead of 12s. Non-reasoning
+                # models ignore this field (verified against qwen2.5:3b).
+                "think": False,
                 "options": {"temperature": 0.1, "num_ctx": 8192},
                 "format": "json",
             },
