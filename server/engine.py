@@ -82,6 +82,22 @@ def _content_hash(content: str) -> str:
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
+def _cut_at_word(text: str, target: int) -> str:
+    """Cut `text` at `target` chars, preferring a word boundary.
+
+    A raw slice lands mid-word (the INDEX used to end at "...MENTI"), which
+    reads like corruption rather than an intentional budget cut. Falls back to
+    the hard cut when there is no usable space near the target.
+    """
+    target = max(1, int(target))
+    if target >= len(text):
+        return text
+    window = text.rfind(" ", 0, target)
+    if window >= max(400, target // 2):
+        return text[:window].rstrip()
+    return text[:target]
+
+
 def _name_similarity(a: str, b: str) -> float:
     """Cheap character-level similarity in [0,1] (difflib-free)."""
     a, b = _norm_name(a), _norm_name(b)
@@ -1003,14 +1019,14 @@ class MemoryEngine:
                 payload["approx_tokens"] = tokens
                 return payload
             if len(body) > 400:
-                body = body[: max(400, int(len(body) * 0.75))]
+                body = _cut_at_word(body, max(400, int(len(body) * 0.75)))
                 truncated_index = True
                 continue
             if len(cards) > 1:
                 cards = cards[:-1]
                 truncated_cards = True
                 continue
-            body = body[:800]
+            body = _cut_at_word(body, 800)
             truncated_index = True
             payload = {
                 "mode": "index",
@@ -1461,6 +1477,13 @@ class MemoryEngine:
         links = await self.graph.run(Q.CLEAR_EPISODE_LINKS, episode_id=memory_id)
         provenance = await self.graph.run(Q.DROP_PROVENANCE_EDGES, episode_id=memory_id)
         stale = await self.graph.run(Q.PURGE_STALE_EDGES)
+        provenance_count = int((provenance[0].get("deleted") if provenance else 0) or 0)
+        # PURGE_STALE_EDGES is deliberately graph-wide: it sweeps every edge
+        # whose endpoint lost its last ACTIVE episode, not only this one's.
+        # Reporting that sum as if this delete caused it read as over-deletion
+        # ("79 links removed for a note that extracted nothing"), so the two
+        # are now reported separately.
+        stale_count = int((stale[0].get("deleted") if stale else 0) or 0)
         removed_nodes = {"deleted": 0}
         if exclusive_ids:
             removed_nodes = await self.graph.run_one(
@@ -1471,8 +1494,9 @@ class MemoryEngine:
             "episode_id": memory_id,
             "facts_invalidated": int((facts[0].get("invalidated") if facts else 0) or 0),
             "links_removed": int((links[0].get("deleted") if links else 0) or 0),
-            "edges_removed": int((provenance[0].get("deleted") if provenance else 0) or 0)
-            + int((stale[0].get("deleted") if stale else 0) or 0),
+            "edges_removed": provenance_count + stale_count,
+            "provenance_edges_removed": provenance_count,
+            "stale_edges_purged_globally": stale_count,
             "nodes_removed": int(removed_nodes.get("deleted") or 0),
         }
 
@@ -1606,16 +1630,33 @@ class MemoryEngine:
     async def health(self) -> dict:
         neo4j_ok = await self.graph.ping()
         ollama_ok = await self.embedder.health()
-        stats = {}
+        stats: dict = {}
+        queue: dict = {}
         if neo4j_ok:
             try:
                 stats = (await self.graph.run(Q.HEALTH_STATS))[0]
             except Exception:  # noqa: BLE001
                 stats = {}
+            try:
+                queue = (await self.graph.run(Q.HEALTH_QUEUE))[0]
+            except Exception:  # noqa: BLE001
+                queue = {}
+
+        # Is the configured extraction model actually present in Ollama?
+        # Without this a model swap (or a stray `ollama rm`) surfaces only as
+        # a 404 per episode while /health keeps claiming everything is fine.
+        # has_model() only fails when Ollama is up but the model is missing,
+        # so a dead Ollama still reports through `ollama` alone.
+        extract_model = getattr(self.llm, "_model", "") or ""
+        model_ok = await self.embedder.has_model(extract_model)
+
         return {
-            "ok": neo4j_ok and ollama_ok,
+            "ok": neo4j_ok and ollama_ok and model_ok,
             "neo4j": neo4j_ok,
             "ollama": ollama_ok,
+            "extract_model": extract_model,
+            "model_available": model_ok,
+            "queue": queue,
             "stats": stats,
         }
 

@@ -905,9 +905,24 @@ SET n.access_count = coalesce(n.access_count, 0) + 1
 RETURN n.id AS id
 """
 
+# Neo4j rejects `count{n:Episode}` ("Variable `Episode` not defined"), which
+# is why /health always returned stats:{}. Three explicit counts, one row.
 HEALTH_STATS = """
-MATCH (n)
-RETURN count{n:Episode} AS episodes,
-       count{n:Entity} AS entities,
-       count{n:Fact} AS facts
+OPTIONAL MATCH (e:Episode)
+WITH count(e) AS episodes
+OPTIONAL MATCH (en:Entity)
+WITH episodes, count(en) AS entities
+OPTIONAL MATCH (f:Fact)
+RETURN episodes, entities, count(f) AS facts
+"""
+
+# Queue health so a stuck/failed extraction lane is visible without querying
+# the graph by hand (surfaced by /health as `queue`).
+HEALTH_QUEUE = """
+OPTIONAL MATCH (e:Episode)
+WHERE e.status = 'failed'
+WITH count(e) AS failed
+OPTIONAL MATCH (p:Episode)
+WHERE p.status = 'pending'
+RETURN failed, count(p) AS pending
 """

@@ -42,5 +42,27 @@ class OllamaEmbedder:
         except Exception:
             return False
 
+    async def has_model(self, name: str) -> bool:
+        """True when `name` is present in Ollama's model list.
+
+        Cheap: a tags listing only, no weights loaded (a real generate would
+        pull 16 GB into RAM on every health probe). This is what turns "every
+        extraction 404s and nobody knows why" into a visible 503.
+
+        Returns True on any doubt so a transient Ollama hiccup cannot itself
+        flip health to unhealthy -- `health()` already reports Ollama being
+        down, and that must stay the single source for it.
+        """
+        if not name:
+            return True
+        try:
+            resp = await self._client.get(f"{self._url}/api/tags", timeout=5.0)
+            if resp.status_code != 200:
+                return True
+            names = [m.get("name", "") for m in resp.json().get("models", [])]
+            return name in names or f"{name}:latest" in names
+        except Exception:
+            return True
+
     async def close(self) -> None:
         await self._client.aclose()
