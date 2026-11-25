@@ -64,7 +64,15 @@ EXTRACT_TIMEOUT_SECONDS = 210
 # fuzzy or force is set. Bigram-Jaccard over normalised names: "Slingshot
 # Results Hub" vs "Renaldi Tjahaya" scores ~0.03, real variants score 0.5+.
 MIN_RESOLVE_SIMILARITY = 0.35
-INDEX_TOKEN_BUDGET = 2000
+# The INDEX is the table of contents for the whole store: a forker (or an
+# agent) needs all of it to decide what to open next. 2000 cut it mid-card
+# at ~2,400 chars; 8000 fits a full card list comfortably. Truncation stays
+# as a last-resort safety valve below.
+INDEX_TOKEN_BUDGET = 8000
+# Recall scores are uncalibrated (a totally unrelated query can land ~0.57),
+# so the top score alone is not evidence of a match. Below this we flag the
+# response instead of silently presenting garbage as relevant.
+RECALL_NO_MATCH_THRESHOLD = 0.60
 SNIPPET_CHARS = 200
 
 
@@ -510,14 +518,22 @@ class MemoryEngine:
             if subject_id:
                 await self._detect_conflict(subject_id, fact.content, fact_id)
 
+        to_embed: list[tuple[str, str]] = []
         for ent in entities:
             ent_id = name_to_entity_id.get(_norm_name(ent.name))
             if not ent_id or ent_id not in linked_ids:
                 continue
+            to_embed.append((ent_id, f"{ent.name} ({ent.type}): {ent.description or ent.name}"))
+
+        # One embed round-trip instead of one per entity. With 5-8 entities
+        # this was 5-8 serial Ollama calls AFTER the entities were already
+        # written, which is why episode_status kept saying `pending` for
+        # minutes after the graph visibly had the extraction results.
+        if to_embed:
             try:
-                text = f"{ent.name} ({ent.type}): {ent.description or ent.name}"
-                vec = await self.embedder.embed(text)
-                await self.graph.run(Q.SET_ENTITY_EMBEDDING, entity_id=ent_id, vector=vec)
+                vectors = await self.embedder.embed_batch([t for _e, t in to_embed])
+                for (ent_id, _text), vec in zip(to_embed, vectors):
+                    await self.graph.run(Q.SET_ENTITY_EMBEDDING, entity_id=ent_id, vector=vec)
             except Exception:  # noqa: BLE001
                 pass
 
@@ -777,9 +793,21 @@ class MemoryEngine:
             graph_context["entities_found"] = [entity_names[i] for i in entity_ids]
             try:
                 paths = await self.graph.run(Q.GRAPH_EXPAND, entity_ids=entity_ids, limit=20)
-                graph_context["paths"] = [
-                    f"{p['from_name']} -> {p['rel_type']} -> {p['to_name']}" for p in paths
-                ][:10]
+                # De-dupe: GRAPH_EXPAND selects DISTINCT over (root, type,
+                # from, to, related), so two rows differing only in
+                # `related_name` format to the same line and read as
+                # repetition. Keep first occurrence, cap at 10.
+                _seen_paths: set[str] = set()
+                _paths: list[str] = []
+                for p in paths:
+                    line = f"{p['from_name']} -> {p['rel_type']} -> {p['to_name']}"
+                    if line in _seen_paths:
+                        continue
+                    _seen_paths.add(line)
+                    _paths.append(line)
+                    if len(_paths) >= 10:
+                        break
+                graph_context["paths"] = _paths
                 graph_facts = await self.graph.run(Q.FACTS_FOR_ENTITIES, entity_ids=entity_ids, limit=10)
             except Exception as exc:  # noqa: BLE001
                 log.warning("Graph expansion failed: %s", safe_error(exc))
@@ -884,10 +912,17 @@ class MemoryEngine:
             }
 
         hits = hits[:top_k]
+        best_score = round(max((h.score for h in hits), default=0.0), 4)
         return {
             "mode": "full",
             "results": [h.model_dump() for h in hits],
             "graph_context": graph_context,
+            # Scores are fused and uncalibrated: a query about something that
+            # is simply not stored still scores ~0.57. Surface that so callers
+            # can say "memory has nothing on this" instead of trusting a
+            # confident-looking ranking.
+            "best_score": best_score,
+            "no_good_match": best_score < RECALL_NO_MATCH_THRESHOLD,
         }
 
     @staticmethod

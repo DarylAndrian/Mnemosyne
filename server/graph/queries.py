@@ -815,8 +815,9 @@ MATCH path = (e)-[*1..2]-(related)
 UNWIND relationships(path) AS r
 WITH e, r, related, startNode(r) AS s, endNode(r) AS t
 RETURN DISTINCT e.name AS root, type(r) AS rel_type,
-       s.name AS from_name, t.name AS to_name,
-       coalesce(related.name, '') AS related_name
+       coalesce(s.name, s.key, s.id) AS from_name,
+       coalesce(t.name, t.key, t.id) AS to_name,
+       coalesce(related.name, related.key, '') AS related_name
 LIMIT $limit
 """
 

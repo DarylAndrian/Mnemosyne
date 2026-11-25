@@ -36,8 +36,30 @@ Field rules:
 - entities.type must be one of: Person, Project, Product, Board, Identifier, Service, API, Tool, Decision, Concept, Task
 - Extract ONLY names that appear verbatim in the conversation. Never invent a person, product, board, or project.
 - Do not extract generic words (user, agent, system, memory, task, note, conversation).
+- Do NOT extract labels, headings or test scaffolding as entities: strings like "TEST NOTE", "TEST FACT", "SMOKE", "TEMPORARY", or a bare codeword value are framing, not things.
 - Prefer specific products, boards, projects, people, and explicit ids over broad topics.
-- relationships.type must be one of: USES, DEPENDS_ON, INTEGRATES_WITH, MANAGED_BY, OWNED_BY, CREATED_BY, HAS_PROPERTY, HAS_BEHAVIOR, DECIDED_ON, WORKING_ON, RELATED_TO
+
+Relationships: from_name is the SUBJECT and to_name is the OBJECT, so the triple reads as a
+plain sentence "SUBJECT VERB OBJECT". Use ACTIVE verb types only:
+  OWNS, MANAGES, USES, WORKS_AT, LOCATED_IN, CREATED, DEPENDS_ON, PART_OF,
+  HAS_PROPERTY, HAS_BEHAVIOR, DECIDED_ON, WORKING_ON, INTEGRATES_WITH, RELATED_TO
+Never use passive labels (OWNED_BY, MANAGED_BY, CREATED_BY). If the sentence is passive,
+flip the direction instead of changing the label.
+
+Examples (literal braces are doubled below only because this template is .format()ed):
+- "Kenny and Timothy own HOKI Reward"
+    -> {{"from_name":"Kenny","to_name":"HOKI Reward","type":"OWNS"}}
+    -> {{"from_name":"Timothy","to_name":"HOKI Reward","type":"OWNS"}}
+- "Gusta is the PIC for Travel SIM"
+    -> {{"from_name":"Gusta","to_name":"Travel SIM","type":"MANAGES"}}
+- "Kenny works at HOKI"
+    -> {{"from_name":"Kenny","to_name":"HOKI","type":"WORKS_AT"}}
+- "the warehouse is located in Sendai"
+    -> {{"from_name":"the warehouse","to_name":"Sendai","type":"LOCATED_IN"}}
+- "Daryl deploys to the tunnel"
+    -> {{"from_name":"Daryl","to_name":"the tunnel","type":"USES"}}
+- Read-back check: "Kenny OWNS HOKI Reward" is a sentence; "Kenny OWNED_BY HOKI Reward" is not.
+
 - facts.confidence: explicit statement = 0.95, clear inference = 0.8, guess = 0.6
 - Output ONLY the JSON object. No markdown fences, no commentary, no trailing text.
 - Do not invent entities not mentioned in the conversation.
@@ -57,9 +79,14 @@ ALLOWED_ENTITY_TYPES = {
 }
 
 ALLOWED_REL_TYPES = {
-    "USES", "DEPENDS_ON", "INTEGRATES_WITH", "MANAGED_BY", "OWNED_BY",
-    "CREATED_BY", "CONTRADICTS", "SUPERSEDES", "HAS_PROPERTY", "HAS_BEHAVIOR",
-    "DECIDED_ON", "WORKING_ON", "MENTIONED_IN", "RELATED_TO",
+    # Active verbs: the prompt asks for these so a triple reads as a sentence.
+    "OWNS", "MANAGES", "USES", "WORKS_AT", "LOCATED_IN", "CREATED",
+    "DEPENDS_ON", "PART_OF", "INTEGRATES_WITH", "HAS_PROPERTY", "HAS_BEHAVIOR",
+    "DECIDED_ON", "WORKING_ON", "CONTRADICTS", "SUPERSEDES", "MENTIONED_IN",
+    "RELATED_TO",
+    # Legacy passive labels kept so pre-migration output still parses instead
+    # of silently degrading to RELATED_TO. The prompt forbids these.
+    "OWNED_BY", "MANAGED_BY", "CREATED_BY",
 }
 
 

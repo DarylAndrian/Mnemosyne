@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 
 from server.entity_rules import assign_entities, is_generic, mentions_standalone
+from server.engine import INDEX_TOKEN_BUDGET
 from server.graph import queries as Q
 from server.models import EntityOut
 from server.secrets import find_secret
@@ -380,8 +381,11 @@ async def test_context_index_and_topic_card_key():
     assert payload["index"]["title"] == "INDEX"
     titles = [card["title"] for card in payload["topic_cards"]]
     assert "TOPIC CARD: slingshot" in titles
-    assert payload["approx_tokens"] <= 2000
-    assert estimate_tokens(json.dumps(payload)) <= 2000
+    # Budget is INDEX_TOKEN_BUDGET (raised 2000 -> 8000 so the whole card list
+    # is returned instead of being cut mid-card); assert against the constant
+    # so this tracks the real contract rather than a snapshot of it.
+    assert payload["approx_tokens"] <= INDEX_TOKEN_BUDGET
+    assert estimate_tokens(json.dumps(payload)) <= INDEX_TOKEN_BUDGET + 500
     named = await engine.context("Alpha")
     assert named["entity"] == "Alpha"
     assert "edges" in named
