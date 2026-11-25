@@ -489,7 +489,14 @@ FOREACH (_ IN CASE WHEN $type = 'HAS_BEHAVIOR' THEN [1] ELSE [] END | MERGE (a)-
 FOREACH (_ IN CASE WHEN $type = 'DECIDED_ON' THEN [1] ELSE [] END | MERGE (a)-[:DECIDED_ON]->(b))
 FOREACH (_ IN CASE WHEN $type = 'WORKING_ON' THEN [1] ELSE [] END | MERGE (a)-[:WORKING_ON]->(b))
 FOREACH (_ IN CASE WHEN $type = 'MENTIONED_IN' THEN [1] ELSE [] END | MERGE (a)-[:MENTIONED_IN]->(b))
-FOREACH (_ IN CASE WHEN NOT $type IN ['USES','DEPENDS_ON','INTEGRATES_WITH','MANAGED_BY','OWNED_BY','CREATED_BY','CONTRADICTS','SUPERSEDES','HAS_PROPERTY','HAS_BEHAVIOR','DECIDED_ON','WORKING_ON','MENTIONED_IN'] THEN [1] ELSE [] END | MERGE (a)-[:RELATED_TO]->(b))
+FOREACH (_ IN CASE WHEN $type = 'OWNS' THEN [1] ELSE [] END | MERGE (a)-[:OWNS]->(b))
+FOREACH (_ IN CASE WHEN $type = 'MANAGES' THEN [1] ELSE [] END | MERGE (a)-[:MANAGES]->(b))
+FOREACH (_ IN CASE WHEN $type = 'WORKS_AT' THEN [1] ELSE [] END | MERGE (a)-[:WORKS_AT]->(b))
+FOREACH (_ IN CASE WHEN $type = 'LOCATED_IN' THEN [1] ELSE [] END | MERGE (a)-[:LOCATED_IN]->(b))
+FOREACH (_ IN CASE WHEN $type = 'CREATED' THEN [1] ELSE [] END | MERGE (a)-[:CREATED]->(b))
+FOREACH (_ IN CASE WHEN $type = 'PART_OF' THEN [1] ELSE [] END | MERGE (a)-[:PART_OF]->(b))
+FOREACH (_ IN CASE WHEN $type = 'RELATED_TO' THEN [1] ELSE [] END | MERGE (a)-[:RELATED_TO]->(b))
+FOREACH (_ IN CASE WHEN NOT $type IN ['USES','DEPENDS_ON','INTEGRATES_WITH','MANAGED_BY','OWNED_BY','CREATED_BY','CONTRADICTS','SUPERSEDES','HAS_PROPERTY','HAS_BEHAVIOR','DECIDED_ON','WORKING_ON','MENTIONED_IN','OWNS','MANAGES','WORKS_AT','LOCATED_IN','CREATED','PART_OF','RELATED_TO'] THEN [1] ELSE [] END | MERGE (a)-[:RELATED_TO]->(b))
 RETURN count(*) AS done
 """
 
@@ -815,9 +822,9 @@ MATCH path = (e)-[*1..2]-(related)
 UNWIND relationships(path) AS r
 WITH e, r, related, startNode(r) AS s, endNode(r) AS t
 RETURN DISTINCT e.name AS root, type(r) AS rel_type,
-       coalesce(s.name, s.key, s.id) AS from_name,
-       coalesce(t.name, t.key, t.id) AS to_name,
-       coalesce(related.name, related.key, '') AS related_name
+       coalesce(nullif(s.name, ''), nullif(s.key, ''), s.id) AS from_name,
+       coalesce(nullif(t.name, ''), nullif(t.key, ''), t.id) AS to_name,
+       coalesce(nullif(related.name, ''), nullif(related.key, ''), '') AS related_name
 LIMIT $limit
 """
 

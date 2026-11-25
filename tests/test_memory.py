@@ -392,6 +392,30 @@ async def test_context_index_and_topic_card_key():
     await engine.close()
 
 
+async def test_recall_reports_backend_down_instead_of_empty_results():
+    """A dead graph must not look like an empty memory.
+
+    Every query inside recall() is individually wrapped in try/except, so a
+    downed Neo4j used to return {"results": []} -- indistinguishable from
+    "nothing stored", which is the one answer that would make a caller stop
+    trusting the store or, worse, silently write a duplicate.
+    """
+    engine, graph, _llm = await make_engine()
+    await engine.remember("Kenny owns HOKI Reward", agent_id="host")
+    await settle(engine)
+
+    async def _down() -> bool:
+        return False
+
+    graph.ping = _down
+    out = await engine.recall("Kenny")
+    assert out["results"] == []
+    assert out.get("error"), "backend-down recall must carry an error"
+    assert "unavailable" in out["error"]
+    assert out["no_good_match"] is True
+    await engine.close()
+
+
 async def test_mentioned_in_target_backfill_and_orphans():
     engine, graph, _llm = await make_engine()
     await graph.run(

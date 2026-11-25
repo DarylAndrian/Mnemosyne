@@ -755,6 +755,20 @@ class MemoryEngine:
         top_k = max(1, min(top_k, 20))
         candidate_pool = top_k * 3
 
+        # A dead backend must look dead. Otherwise every downstream query is
+        # swallowed by its own try/except and the caller gets {"results": []},
+        # which is indistinguishable from "your memory has nothing on this" --
+        # the worst possible failure mode for a memory store.
+        if not await self.graph.ping():
+            return {
+                "mode": mode,
+                "results": [],
+                "error": "graph database unavailable; results are not empty, the lookup did not run",
+                "graph_context": {"entities_found": [], "paths": []},
+                "best_score": 0.0,
+                "no_good_match": True,
+            }
+
         vector_results: list[dict] = []
         fts_results: list[dict] = []
         fact_fts_results: list[dict] = []
