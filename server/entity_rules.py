@@ -98,11 +98,46 @@ _FRAMING_WORDS = {
 
 
 def is_framing_label(name: str) -> bool:
-    """True when a name is headings/test scaffolding that only looks like a name."""
+    """True when a name is headings/test scaffolding that only looks like a name.
+
+    Two shapes: built only from framing words ("TEST NOTE"), or ending in one
+    ("MNEMOSYNE ENGINE TEST", "HOKI RELEASE NOTES"). A trailing framing word
+    marks a section heading, not a thing, while names like "Kenny" or
+    "HOKI Reward" are untouched.
+    """
     words = re.findall(r"[a-z0-9]+", (name or "").lower())
     if not words:
         return False
-    return all(w in _FRAMING_WORDS for w in words)
+    if all(w in _FRAMING_WORDS for w in words):
+        return True
+    return words[-1] in _FRAMING_WORDS
+
+
+# Phrases that mark model meta-commentary about the extraction task rather
+# than a fact about the world. These used to reach recall output as
+# authoritative-sounding statements ("A product mentioned in the
+# conversation", "No agent uses them since 2026-11-08").
+_META_FACT_PATTERNS = re.compile(
+    r"(?i)\b(the conversation|mentioned in|as mentioned|the above text|"
+    r"the given text|the provided text|this note|the note says|no agent uses|"
+    r"is a (product|person|concept|entity) mentioned|appears in the)\b"
+)
+
+
+def is_low_value_fact(content: str, source_agent_id: str = "", source_episode_id: str = "") -> bool:
+    """True for facts that should never surface as findings.
+
+    Two failure modes: meta-commentary about the extraction input itself, and
+    statements with no provenance at all -- neither can be trusted or acted on.
+    """
+    text = (content or "").strip()
+    if len(text) < 15:
+        return True
+    if _META_FACT_PATTERNS.search(text):
+        return True
+    if not (source_agent_id or "").strip() and not (source_episode_id or "").strip():
+        return True
+    return False
 
 
 def is_generic(name: str) -> bool:

@@ -22,6 +22,7 @@ from .entity_rules import (
     is_absorbed_name,
     is_framing_label,
     is_generic,
+    is_low_value_fact,
     mentions_standalone,
     mine_entities,
     too_common,
@@ -70,10 +71,12 @@ MIN_RESOLVE_SIMILARITY = 0.35
 # at ~2,400 chars; 8000 fits a full card list comfortably. Truncation stays
 # as a last-resort safety valve below.
 INDEX_TOKEN_BUDGET = 8000
-# Recall scores are uncalibrated (a totally unrelated query can land ~0.57),
-# so the top score alone is not evidence of a match. Below this we flag the
-# response instead of silently presenting garbage as relevant.
-RECALL_NO_MATCH_THRESHOLD = 0.60
+# Recall scores are uncalibrated (a totally unrelated query lands ~0.5-0.6,
+# the same band as real hits), so the score alone cannot decide whether there
+# is a match. The verdict comes from _lexical_support() instead: how much of
+# the winner is backed by query terms that are rare in the candidate pool.
+# Below this the ranking rests on embeddings alone and we say so.
+RECALL_MIN_LEXICAL_SUPPORT = 0.05
 SNIPPET_CHARS = 200
 
 
@@ -105,6 +108,57 @@ def _cut_at_word(text: str, target: int) -> str:
     if window >= max(400, target // 2):
         return text[:window].rstrip()
     return text[:target]
+
+
+_QUERY_STOPWORDS = {
+    "a", "an", "and", "are", "as", "at", "be", "but", "by", "can", "could",
+    "did", "do", "does", "for", "from", "get", "had", "has", "have", "how",
+    "i", "if", "in", "into", "is", "it", "its", "me", "my", "not", "of",
+    "on", "or", "our", "s", "say", "should", "so", "t", "tell", "that",
+    "the", "their", "them", "then", "there", "these", "they", "this", "to",
+    "us", "was", "we", "were", "what", "when", "which", "who", "why", "will",
+    "with", "would", "you", "your", "stand", "stands", "mean", "means",
+    "please", "now", "update", "about", "know", "need", "want",
+}
+
+
+def _query_terms(query: str) -> list[str]:
+    """Content-bearing terms of a query: short filler words carry no signal."""
+    tokens = re.findall(r"[\w\u4e00-\u9fff]+", (query or "").lower())
+    return [t for t in tokens if len(t) >= 2 and t not in _QUERY_STOPWORDS]
+
+
+def _lexical_support(
+    query: str, top_text: str, top_entities: list[str], pool_texts: list[str]
+) -> float:
+    """How much of the query is *lexically* evidenced by the top hit.
+
+    Fused scores are uncalibrated: an unrelated query still lands ~0.5-0.6,
+    inside the same band as real hits, so an absolute cutoff can never work.
+    This asks a different question: of the query's content-bearing terms, how
+    much of the top hit's support comes from terms that are actually RARE in
+    the candidate pool?
+
+    A term appearing in every candidate carries no information ("HOKI" in a
+    store full of HOKI cards), while a term appearing in one candidate is the
+    reason that candidate is there ("gomas"). So each matched term is weighted
+    by 1 - df/n over the pool. Zero means the ranking rests on embeddings
+    alone, with nothing in the text agreeing -- which is what a confident
+    wrong answer looks like.
+    """
+    terms = _query_terms(query)
+    if not terms:
+        return 0.0
+    haystack = f"{top_text} {' '.join(top_entities or [])}".lower()
+    pool = [p.lower() for p in pool_texts] or [haystack]
+    n = len(pool)
+    total = 0.0
+    for term in terms:
+        if term not in haystack:
+            continue
+        df = sum(1 for p in pool if term in p)
+        total += 1.0 - (df / n)
+    return round(total / len(terms), 4)
 
 
 def _name_similarity(a: str, b: str) -> float:
@@ -861,23 +915,36 @@ class MemoryEngine:
             # Lucene scores are unbounded; squash into (0,1]
             _bump(rec, "keyword", 1.0 / (1.0 + 1.0 / max(rec.get("score", 0.0), 1e-6)), "episode")
         for rec in fact_fts_results:
+            if is_low_value_fact(
+                rec.get("content", ""),
+                rec.get("source_agent_id") or "",
+                rec.get("source_episode_id") or "",
+            ):
+                continue
             _bump(rec, "keyword", 1.0 / (1.0 + 1.0 / max(rec.get("score", 0.0), 1e-6)), "fact")
         for rec in graph_facts:
             rid = rec.get("id")
-            if rid:
-                entry = fused.setdefault(rid, {
-                    "vector": 0.0, "keyword": 0.0, "graph": 0.0,
-                    "content": rec.get("content", ""), "kind": "fact",
-                    "source_agent_id": rec.get("source_agent_id"),
-                    "source_session_id": None,
-                    "source": rec.get("source_agent_id"),
-                    "created_at": rec.get("created_at"), "entities": [],
-                    "episode_id": None,
-                })
-                entry["graph"] = max(entry["graph"], 0.8)
-                ent = entity_names.get(rec.get("subject_id"))
-                if ent and ent not in entry["entities"]:
-                    entry["entities"].append(ent)
+            if not rid:
+                continue
+            if is_low_value_fact(
+                rec.get("content", ""),
+                rec.get("source_agent_id") or "",
+                rec.get("source_episode_id") or "",
+            ):
+                continue
+            entry = fused.setdefault(rid, {
+                "vector": 0.0, "keyword": 0.0, "graph": 0.0,
+                "content": rec.get("content", ""), "kind": "fact",
+                "source_agent_id": rec.get("source_agent_id"),
+                "source_session_id": None,
+                "source": rec.get("source_agent_id"),
+                "created_at": rec.get("created_at"), "entities": [],
+                "episode_id": None,
+            })
+            entry["graph"] = max(entry["graph"], 0.8)
+            ent = entity_names.get(rec.get("subject_id"))
+            if ent and ent not in entry["entities"]:
+                entry["entities"].append(ent)
 
         episode_ids = [rid for rid, entry in fused.items() if entry["kind"] == "episode"]
         if episode_ids:
@@ -916,6 +983,20 @@ class MemoryEngine:
             ))
 
         hits.sort(key=lambda h: h.score, reverse=True)
+
+        # Lexical evidence for the winner. Scores alone cannot separate real
+        # hits from confident noise (both land ~0.5-0.6), so the match verdict
+        # is carried by whether the query's rare terms actually appear.
+        pool_texts = [e.get("content", "") for e in fused.values()]
+        top_hit = hits[0] if hits else None
+        keyword_support = (
+            _lexical_support(query, top_hit.content, list(top_hit.entities), pool_texts)
+            if top_hit is not None
+            else 0.0
+        )
+        best_score = round(max((h.score for h in hits), default=0.0), 4)
+        no_good_match = top_hit is None or keyword_support < RECALL_MIN_LEXICAL_SUPPORT
+
         if mode == "snippet":
             hits = [hit for hit in hits if hit.kind == "episode" and hit.episode_id][:top_k]
             return {
@@ -929,20 +1010,19 @@ class MemoryEngine:
                     }
                     for hit in hits
                 ],
+                "best_score": best_score,
+                "keyword_support": keyword_support,
+                "no_good_match": no_good_match,
             }
 
         hits = hits[:top_k]
-        best_score = round(max((h.score for h in hits), default=0.0), 4)
         return {
             "mode": "full",
             "results": [h.model_dump() for h in hits],
             "graph_context": graph_context,
-            # Scores are fused and uncalibrated: a query about something that
-            # is simply not stored still scores ~0.57. Surface that so callers
-            # can say "memory has nothing on this" instead of trusting a
-            # confident-looking ranking.
             "best_score": best_score,
-            "no_good_match": best_score < RECALL_NO_MATCH_THRESHOLD,
+            "keyword_support": keyword_support,
+            "no_good_match": no_good_match,
         }
 
     @staticmethod

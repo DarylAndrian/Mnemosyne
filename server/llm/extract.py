@@ -61,6 +61,12 @@ Examples (literal braces are doubled below only because this template is .format
 - Read-back check: "Kenny OWNS HOKI Reward" is a sentence; "Kenny OWNED_BY HOKI Reward" is not.
 
 - facts.confidence: explicit statement = 0.95, clear inference = 0.8, guess = 0.6
+- Emit a fact for EVERY substantive statement in the conversation, including
+  ones you also turned into a relationship. A relationship between two named
+  things is not a substitute for the fact that was said: "Gusta works at
+  Travel SIM" must appear BOTH as the WORKS_AT relationship AND as a fact
+  about Gusta. Facts are what recall quotes back, so anything left only as an
+  edge is lost to a reader.
 - Output ONLY the JSON object. No markdown fences, no commentary, no trailing text.
 - Do not invent entities not mentioned in the conversation.
 - Use consistent names (the most common form used in the conversation).
