@@ -392,6 +392,23 @@ async def test_context_index_and_topic_card_key():
     await engine.close()
 
 
+def test_framing_labels_are_not_entities():
+    """Headings and test scaffolding are not things.
+
+    The regex miner matched "TEST NOTE" as an all-caps phrase and stored it
+    as a Product, so recall output advertised it as a real entity.
+    """
+    from server.entity_rules import is_framing_label, mine_entities
+
+    for label in ("TEST NOTE", "TEST FACT", "Temporary test entry", "SMOKE TEST", "codeword"):
+        assert is_framing_label(label), label
+    for real in ("Kenny", "HOKI Reward", "the warehouse", "Sendai", "CloudDrive"):
+        assert not is_framing_label(real), real
+
+    mined = [e.name for e in mine_entities("TEST NOTE: Kenny owns HOKI Reward.")]
+    assert "TEST NOTE" not in mined
+
+
 async def test_recall_reports_backend_down_instead_of_empty_results():
     """A dead graph must not look like an empty memory.
 

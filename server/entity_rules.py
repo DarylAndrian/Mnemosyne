@@ -86,6 +86,25 @@ def compact_name(name: str) -> str:
     return re.sub(r"[^a-z0-9]", "", (name or "").lower())
 
 
+# Words that mark a heading, a test fixture or other framing rather than a
+# thing. "TEST NOTE", "TEMPORARY TEST ENTRY", "SMOKE TEST" all look like
+# names to the regex miners but are scaffolding -- and once stored they read
+# as real entities in recall output.
+_FRAMING_WORDS = {
+    "test", "note", "fact", "smoke", "temp", "temporary", "entry", "header",
+    "heading", "label", "title", "section", "example", "sample", "draft",
+    "todo", "fixme", "placeholder", "codeword", "keyword", "misc", "various",
+}
+
+
+def is_framing_label(name: str) -> bool:
+    """True when a name is headings/test scaffolding that only looks like a name."""
+    words = re.findall(r"[a-z0-9]+", (name or "").lower())
+    if not words:
+        return False
+    return all(w in _FRAMING_WORDS for w in words)
+
+
 def is_generic(name: str) -> bool:
     cleaned = re.sub(r"\s+", " ", (name or "").strip().lower())
     if not cleaned or cleaned in GENERIC_ENTITY_NAMES:
@@ -156,7 +175,9 @@ def mine_entities(content: str) -> list[EntityOut]:
 
     def add(name: str, type_name: str) -> None:
         cleaned = _clean_label(name)
-        if not cleaned or not grounded_in_text(cleaned, content) or is_generic(cleaned):
+        if not cleaned or is_framing_label(cleaned):
+            return
+        if not grounded_in_text(cleaned, content) or is_generic(cleaned):
             return
         key = cleaned.lower()
         if key in seen:

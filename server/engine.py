@@ -20,6 +20,7 @@ from .entity_rules import (
     acceptable_alias,
     grounded_in_text,
     is_absorbed_name,
+    is_framing_label,
     is_generic,
     mentions_standalone,
     mine_entities,
@@ -435,7 +436,12 @@ class MemoryEngine:
         seen: set[str] = set()
         for ent in list(extraction.entities) + mine_entities(content):
             name = (ent.name or "").strip()
-            if not name or is_generic(name) or not grounded_in_text(name, content):
+            # is_framing_label drops headings/test scaffolding ("TEST NOTE")
+            # that the regex miners and, on older models, the LLM emit as if
+            # they were things.
+            if not name or is_generic(name) or is_framing_label(name):
+                continue
+            if not grounded_in_text(name, content):
                 continue
             key = name.lower()
             if key in seen:
