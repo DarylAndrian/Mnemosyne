@@ -152,11 +152,17 @@ def _lexical_support(
     haystack = f"{top_text} {' '.join(top_entities or [])}".lower()
     pool = [p.lower() for p in pool_texts] or [haystack]
     n = len(pool)
+
+    def _has(text: str, term: str) -> bool:
+        # Word-boundary match: "ss" must not score inside "assessment", which
+        # would both inflate df and make acronym queries look unsupported.
+        return re.search(rf"(?<![a-z0-9]){re.escape(term)}(?![a-z0-9])", text) is not None
+
     total = 0.0
     for term in terms:
-        if term not in haystack:
+        if not _has(haystack, term):
             continue
-        df = sum(1 for p in pool if term in p)
+        df = sum(1 for p in pool if _has(p, term))
         total += 1.0 - (df / n)
     return round(total / len(terms), 4)
 
@@ -984,18 +990,20 @@ class MemoryEngine:
 
         hits.sort(key=lambda h: h.score, reverse=True)
 
-        # Lexical evidence for the winner. Scores alone cannot separate real
-        # hits from confident noise (both land ~0.5-0.6), so the match verdict
-        # is carried by whether the query's rare terms actually appear.
+        # Lexical evidence for the ranking. Scores alone cannot separate real
+        # hits from confident noise (both land ~0.5-0.6), so the verdict comes
+        # from whether the query's rare terms actually appear in the results.
+        # Measured over ALL returned hits, not just the first: the right card
+        # can rank #3 while #1 is an embedding artefact, and flagging on #1
+        # alone marked every real query as no-match too.
         pool_texts = [e.get("content", "") for e in fused.values()]
-        top_hit = hits[0] if hits else None
-        keyword_support = (
-            _lexical_support(query, top_hit.content, list(top_hit.entities), pool_texts)
-            if top_hit is not None
-            else 0.0
-        )
+        keyword_support = 0.0
+        for h in hits[: max(top_k, 5)]:
+            s = _lexical_support(query, h.content, list(h.entities), pool_texts)
+            if s > keyword_support:
+                keyword_support = s
         best_score = round(max((h.score for h in hits), default=0.0), 4)
-        no_good_match = top_hit is None or keyword_support < RECALL_MIN_LEXICAL_SUPPORT
+        no_good_match = not hits or keyword_support < RECALL_MIN_LEXICAL_SUPPORT
 
         if mode == "snippet":
             hits = [hit for hit in hits if hit.kind == "episode" and hit.episode_id][:top_k]
